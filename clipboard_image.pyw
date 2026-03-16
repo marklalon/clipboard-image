@@ -8,19 +8,34 @@ import os
 import sys
 import ctypes
 import ctypes.wintypes
+
+# Enable DPI awareness to prevent screenshot scaling issues
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    pass  # May fail on older Windows versions
+
 import threading
 import logging
 import urllib.parse
 from datetime import datetime
+from io import BytesIO
 
+import tkinter as tk
 import pystray
 import pythoncom
 import win32gui
 import win32com.client
-from PIL import Image, ImageGrab
+import win32clipboard
+import win32con
+from PIL import Image, ImageGrab, ImageTk
 
 # --- Logging setup ---
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clipboard_image.log")
+
+# Clear log file on startup
+if os.path.exists(LOG_PATH):
+    open(LOG_PATH, "w", encoding="utf-8").close()
 
 # Set up root logger to avoid Pillow debug noise
 logging.getLogger().setLevel(logging.WARNING)
@@ -124,14 +139,30 @@ def generate_filename(directory):
 _tray_icon = None
 
 
+def get_clipboard_image():
+    """Get image from clipboard. Returns PIL Image or None."""
+    img = ImageGrab.grabclipboard()
+    if isinstance(img, Image.Image):
+        log.debug("Got image via ImageGrab.grabclipboard()")
+        return img
+    if isinstance(img, list):
+        # List of file paths - try to open as images
+        for path in img:
+            try:
+                return Image.open(path)
+            except Exception:
+                pass
+    return None
+
+
 def on_paste():
     """Handle Ctrl+V: save clipboard image to Explorer directory."""
     log.debug("on_paste triggered")
     try:
-        img = ImageGrab.grabclipboard()
+        img = get_clipboard_image()
         log.debug(f"Clipboard content type: {type(img)}")
 
-        if not isinstance(img, Image.Image):
+        if img is None:
             log.debug("Clipboard does not contain an image, passing through")
             return
 
@@ -148,11 +179,209 @@ def on_paste():
         log.error(f"Error in on_paste: {e}", exc_info=True)
 
 
+def copy_image_to_clipboard(img):
+    """Copy a PIL Image to the Windows clipboard."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    output = BytesIO()
+    try:
+        # PIL writes a valid BMP including correct row padding.
+        img.save(output, "BMP")
+        dib_data = output.getvalue()[14:]
+        log.debug(f"Prepared CF_DIB payload: {len(dib_data)} bytes")
+    finally:
+        output.close()
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_DIB, dib_data)
+        log.info("Image copied to clipboard")
+    finally:
+        win32clipboard.CloseClipboard()
+
+
+def on_screenshot():
+    """Handle Alt+A: launch screenshot selection mode."""
+    log.debug("on_screenshot triggered")
+    try:
+        selector = ScreenshotSelector()
+        selector.run()
+    except Exception as e:
+        log.error(f"Error in on_screenshot: {e}", exc_info=True)
+
+
+class ScreenshotSelector:
+    """Fullscreen screenshot selector with area selection."""
+
+    def __init__(self):
+        self.root = None
+        self.canvas = None
+        self.screenshot = None
+        self.photo = None
+        self.start_x = None
+        self.start_y = None
+        self.rect_id = None
+        self.selection_box = None
+        self.pending_start = None
+        self.dragging_selection = False
+
+    def run(self):
+        """Run the screenshot selector."""
+        # Capture the full screen
+        self.screenshot = ImageGrab.grab()
+        screen_width, screen_height = self.screenshot.size
+
+        # Create fullscreen window
+        self.root = tk.Tk()
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
+        self.root.overrideredirect(True)
+        self.root.config(bg="black")
+
+        # Create canvas to display screenshot
+        self.canvas = tk.Canvas(
+            self.root,
+            width=screen_width,
+            height=screen_height,
+            bg="black",
+            highlightthickness=0,
+        )
+        self.canvas.pack()
+
+        # Display screenshot
+        self.photo = ImageTk.PhotoImage(self.screenshot)
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+
+        # Draw border to indicate screenshot mode
+        border_width = 4
+        border_color = "#FF8C00"
+        for x1, y1, x2, y2 in [
+            (0, 0, screen_width, border_width),
+            (0, screen_height - border_width, screen_width, screen_height),
+            (0, 0, border_width, screen_height),
+            (screen_width - border_width, 0, screen_width, screen_height),
+        ]:
+            self.canvas.create_rectangle(x1, y1, x2, y2, fill=border_color, outline="")
+
+        # Bind events
+        self.canvas.bind("<ButtonPress-1>", self.on_mouse_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<Double-Button-1>", self.on_double_click)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
+        self.canvas.bind("<Button-3>", self.on_right_click)
+        self.root.bind("<Escape>", self.on_escape)
+
+        # Run the main loop
+        self.root.mainloop()
+
+    def on_mouse_press(self, event):
+        """Record start position on mouse press."""
+        # Keep the current selection intact so a confirmation double-click
+        # does not reset it to a tiny box on the first click.
+        if self.selection_box is not None:
+            self.pending_start = (event.x, event.y)
+            self.dragging_selection = False
+            return
+
+        self.start_x = event.x
+        self.start_y = event.y
+        self.pending_start = None
+        self.dragging_selection = True
+        self.selection_box = (event.x, event.y, event.x, event.y)
+
+    def on_mouse_drag(self, event):
+        """Update selection rectangle on mouse drag."""
+        if self.pending_start is not None and not self.dragging_selection:
+            self.start_x, self.start_y = self.pending_start
+            self.pending_start = None
+            self.dragging_selection = True
+            self.selection_box = (self.start_x, self.start_y, event.x, event.y)
+
+        if self.start_x is None:
+            return
+
+        # Delete previous rectangle
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+
+        # Draw new rectangle (gray-white color)
+        self.rect_id = self.canvas.create_rectangle(
+            self.start_x,
+            self.start_y,
+            event.x,
+            event.y,
+            outline="#E0E0E0",
+            width=2,
+            dash=(5, 5),
+        )
+        self.selection_box = (self.start_x, self.start_y, event.x, event.y)
+
+    def on_mouse_release(self, event):
+        """Update final selection on mouse release."""
+        if self.start_x is None or not self.dragging_selection:
+            self.pending_start = None
+            return
+        self.selection_box = (self.start_x, self.start_y, event.x, event.y)
+        self.pending_start = None
+        self.dragging_selection = False
+        log.debug("Selection updated, awaiting double-click confirmation")
+
+    def on_double_click(self, event):
+        """Confirm the current selection on double-click."""
+        self.pending_start = None
+        self.dragging_selection = False
+        self.finish_selection()
+
+    def finish_selection(self):
+        """Crop selected area and copy it to the clipboard."""
+        if self.selection_box is None:
+            return
+
+        # Get selection bounds (normalize to handle any drag direction)
+        x1, y1, x2, y2 = self.selection_box
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+
+        # Ensure minimum size
+        if right - left < 5 or bottom - top < 5:
+            log.debug("Selection too small, ignoring")
+            self.root.destroy()
+            return
+
+        # Crop and copy to clipboard
+        cropped = self.screenshot.crop((left, top, right, bottom))
+        log.debug(f"Selected area: left={left}, top={top}, right={right}, bottom={bottom}")
+        copy_image_to_clipboard(cropped)
+
+        # Show notification
+        if _tray_icon:
+            _tray_icon.notify("Screenshot copied to clipboard", "Screenshot")
+
+        self.root.destroy()
+
+    def on_escape(self, event):
+        """Cancel screenshot on ESC key."""
+        log.debug("Screenshot cancelled by user")
+        self.root.destroy()
+
+    def on_right_click(self, event):
+        """Cancel screenshot on right-click."""
+        log.debug("Screenshot cancelled by right-click")
+        self.root.destroy()
+
+
 # --- Low-level keyboard hook (no admin required) ---
 
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
 VK_V = 0x56
+VK_A = 0x41
 HC_ACTION = 0
 
 user32 = ctypes.windll.user32
@@ -196,6 +425,7 @@ HOOKPROC = ctypes.CFUNCTYPE(
 
 _hook_handle = None
 _ctrl_pressed = False
+_alt_pressed = False
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -210,7 +440,7 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 def _low_level_keyboard_proc(nCode, wParam, lParam):
     """Low-level keyboard hook callback."""
-    global _ctrl_pressed
+    global _ctrl_pressed, _alt_pressed
     try:
         if nCode == HC_ACTION:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
@@ -218,12 +448,28 @@ def _low_level_keyboard_proc(nCode, wParam, lParam):
 
             # Track Ctrl state
             if vk in (0xA2, 0xA3, 0x11):  # VK_LCONTROL, VK_RCONTROL, VK_CONTROL
-                _ctrl_pressed = wParam in (WM_KEYDOWN, 0x0104)
+                old_state = _ctrl_pressed
+                _ctrl_pressed = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                if old_state != _ctrl_pressed:
+                    log.debug(f"Ctrl state changed: {_ctrl_pressed}")
 
-            # Detect Ctrl+V
+            # Track Alt state
+            if vk in (0xA4, 0xA5, 0x12):  # VK_LMENU, VK_RMENU, VK_MENU
+                old_state = _alt_pressed
+                _alt_pressed = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                if old_state != _alt_pressed:
+                    log.debug(f"Alt state changed: {_alt_pressed}")
+
+            # Detect Ctrl+V (save clipboard image to file)
             if vk == VK_V and wParam == WM_KEYDOWN and _ctrl_pressed:
                 log.info("Ctrl+V detected via hook!")
                 threading.Thread(target=on_paste, daemon=True).start()
+
+            # Detect Alt+A (Screenshot mode)
+            # Note: When Alt is held, other keys generate WM_SYSKEYDOWN instead of WM_KEYDOWN
+            if vk == VK_A and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and _alt_pressed:
+                log.info("Alt+A detected via hook!")
+                threading.Thread(target=on_screenshot, daemon=True).start()
     except Exception as e:
         log.error(f"Exception in hook callback: {e}", exc_info=True)
 
