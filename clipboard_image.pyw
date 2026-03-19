@@ -284,6 +284,7 @@ class ScreenshotSelector:
         self.start_x = None
         self.start_y = None
         self.rect_id = None
+        self.rect_outer_id = None
         self.selection_box = None
         self.pending_start = None
         self.dragging_selection = False
@@ -363,19 +364,30 @@ class ScreenshotSelector:
         if self.start_x is None:
             return
 
-        # Delete previous rectangle
+        # Delete previous rectangles
+        if self.rect_outer_id:
+            self.canvas.delete(self.rect_outer_id)
         if self.rect_id:
             self.canvas.delete(self.rect_id)
 
-        # Draw new rectangle (gray-white color)
+        # Draw double-border rectangle for visibility against any background:
+        # white outer halo + black dashed inner line
+        self.rect_outer_id = self.canvas.create_rectangle(
+            self.start_x - 1,
+            self.start_y - 1,
+            event.x + 1,
+            event.y + 1,
+            outline="white",
+            width=3,
+        )
         self.rect_id = self.canvas.create_rectangle(
             self.start_x,
             self.start_y,
             event.x,
             event.y,
-            outline="#E0E0E0",
-            width=2,
-            dash=(5, 5),
+            outline="#111111",
+            width=1,
+            dash=(6, 4),
         )
         self.selection_box = (self.start_x, self.start_y, event.x, event.y)
 
@@ -470,6 +482,9 @@ user32.CallNextHookEx.argtypes = [
 
 user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+
 user32.PostMessageW.argtypes = [
     ctypes.wintypes.HWND,
     ctypes.wintypes.UINT,
@@ -485,8 +500,6 @@ HOOKPROC = ctypes.CFUNCTYPE(
 )
 
 _hook_handle = None
-_ctrl_pressed = False
-_alt_pressed = False
 _config = None
 
 
@@ -515,27 +528,23 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+def _is_key_down(vk_code):
+    """Check if a virtual key is currently held down using GetAsyncKeyState."""
+    return bool(user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+
 def _low_level_keyboard_proc(nCode, wParam, lParam):
     """Low-level keyboard hook callback."""
-    global _ctrl_pressed, _alt_pressed
     try:
         if nCode == HC_ACTION:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = kb.vkCode
 
-            # Track Ctrl state
-            if vk in (0xA2, 0xA3, 0x11):  # VK_LCONTROL, VK_RCONTROL, VK_CONTROL
-                old_state = _ctrl_pressed
-                _ctrl_pressed = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-                if old_state != _ctrl_pressed:
-                    log.debug(f"Ctrl state changed: {_ctrl_pressed}")
-
-            # Track Alt state
-            if vk in (0xA4, 0xA5, 0x12):  # VK_LMENU, VK_RMENU, VK_MENU
-                old_state = _alt_pressed
-                _alt_pressed = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-                if old_state != _alt_pressed:
-                    log.debug(f"Alt state changed: {_alt_pressed}")
+            # Use GetAsyncKeyState for real-time modifier state — avoids desync
+            # that can happen when key-up events are missed (e.g. focus switches
+            # to an elevated window).
+            ctrl_down = _is_key_down(0x11)   # VK_CONTROL
+            alt_down  = _is_key_down(0x12)   # VK_MENU
 
             # Get configured hotkeys
             paste_key = VK_CODES.get(_config["paste_hotkey"]["key"].upper(), VK_V)
@@ -543,20 +552,21 @@ def _low_level_keyboard_proc(nCode, wParam, lParam):
             screenshot_key = VK_CODES.get(_config["screenshot_hotkey"]["key"].upper(), VK_A)
             screenshot_modifier = _config["screenshot_hotkey"]["modifier"].lower()
 
-            # Detect paste hotkey
+            # Detect paste hotkey (only on KEYDOWN to avoid repeat fires)
             paste_modifier_pressed = (
-                (_ctrl_pressed and paste_modifier == "ctrl") or
-                (_alt_pressed and paste_modifier == "alt")
+                (ctrl_down and paste_modifier == "ctrl") or
+                (alt_down  and paste_modifier == "alt")
             )
             if vk == paste_key and wParam == WM_KEYDOWN and paste_modifier_pressed:
                 hotkey_str = f"{paste_modifier.capitalize()}+{_config['paste_hotkey']['key'].upper()}"
                 log.info(f"{hotkey_str} detected via hook!")
                 threading.Thread(target=on_paste, daemon=True).start()
 
-            # Detect screenshot hotkey
+            # Detect screenshot hotkey (accept both KEYDOWN and SYSKEYDOWN so
+            # Alt+X works even when another window owns the Alt focus)
             screenshot_modifier_pressed = (
-                (_ctrl_pressed and screenshot_modifier == "ctrl") or
-                (_alt_pressed and screenshot_modifier == "alt")
+                (ctrl_down and screenshot_modifier == "ctrl") or
+                (alt_down  and screenshot_modifier == "alt")
             )
             if vk == screenshot_key and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and screenshot_modifier_pressed:
                 hotkey_str = f"{screenshot_modifier.capitalize()}+{_config['screenshot_hotkey']['key'].upper()}"
@@ -615,12 +625,12 @@ def stop_keyboard_hook():
 def show_settings_dialog():
     """Show settings dialog for configuring hotkeys."""
     global _config
-    
+
     root = tk.Tk()
     root.title("Settings - Clipboard Image Paster")
     root.resizable(False, False)
     root.attributes("-topmost", True)
-    
+
     # Center the window
     root.update_idletasks()
     width = 350
@@ -628,6 +638,10 @@ def show_settings_dialog():
     x = (root.winfo_screenwidth() // 2) - (width // 2)
     y = (root.winfo_screenheight() // 2) - (height // 2)
     root.geometry(f"{width}x{height}+{x}+{y}")
+
+    # Force focus — tray menu may keep focus, so defer slightly
+    root.lift()
+    root.after(100, lambda: (root.lift(), root.focus_force()))
     
     frame = tk.Frame(root, padx=20, pady=20)
     frame.pack(fill="both", expand=True)

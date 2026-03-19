@@ -1,4 +1,4 @@
-# Clipboard Image Paster
+# Little Helper
 
 A lightweight Windows system tray tool that automatically saves clipboard images as PNG files to the currently active Explorer folder when you press **Ctrl+V**.
 

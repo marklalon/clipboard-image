@@ -1,5 +1,5 @@
 """
-Build script for Clipboard Image Paster
+Build script for Little Helper
 Creates executable using PyInstaller
 """
 
@@ -20,7 +20,7 @@ def clean():
             shutil.rmtree(path)
             print(f"Removed: {path}")
     
-    spec_file = os.path.join(SCRIPT_DIR, "ClipboardImagePaster.spec")
+    spec_file = os.path.join(SCRIPT_DIR, "LittleHelper.spec")
     if os.path.exists(spec_file):
         os.remove(spec_file)
         print(f"Removed: {spec_file}")
@@ -32,7 +32,7 @@ def build():
     
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name=ClipboardImagePaster",
+        "--name=LittleHelper",
         "--onefile",
         "--windowed",  # No console window
         f"--icon={icon_path}",
@@ -46,7 +46,7 @@ def build():
     print(" ".join(cmd))
     subprocess.run(cmd, cwd=SCRIPT_DIR, check=True)
     
-    exe_path = os.path.join(DIST_DIR, "ClipboardImagePaster.exe")
+    exe_path = os.path.join(DIST_DIR, "LittleHelper.exe")
     if os.path.exists(exe_path):
         print(f"\nBuild successful: {exe_path}")
         return exe_path
@@ -57,7 +57,7 @@ def build():
 
 def main():
     print("=" * 50)
-    print("Clipboard Image Paster - Build Script")
+    print("Little Helper - Build Script")
     print("=" * 50)
     
     if len(sys.argv) > 1 and sys.argv[1] == "clean":

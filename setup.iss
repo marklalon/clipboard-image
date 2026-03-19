@@ -1,10 +1,10 @@
-; Clipboard Image Paster - Inno Setup Script
+; Little Helper - Inno Setup Script
 ; Requires Inno Setup 6.0 or later
 
-#define MyAppName "Clipboard Image Paster"
+#define MyAppName "Little Helper"
 #define MyAppVersion "1.0.0"
-#define MyAppPublisher "Clipboard Image Paster"
-#define MyAppExeName "ClipboardImagePaster.exe"
+#define MyAppPublisher "Little Helper"
+#define MyAppExeName "LittleHelper.exe"
 
 [Setup]
 AppId={{8A3F4B5C-6D7E-8F9A-0B1C-2D3E4F5A6B7C}
@@ -15,7 +15,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=installer
-OutputBaseFilename=ClipboardImagePaster-Setup
+OutputBaseFilename=LittleHelper-Setup
 SetupIconFile=icon.ico
 Compression=lzma2
 SolidCompression=yes
@@ -43,7 +43,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Registry]
 ; Auto-start with Windows
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ClipboardImagePaster"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "LittleHelper"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
