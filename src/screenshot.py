@@ -48,7 +48,7 @@ class ScreenshotSelector:
         )
         self.canvas.pack()
 
-        self.photo = ImageTk.PhotoImage(self.screenshot)
+        self.photo = ImageTk.PhotoImage(self.screenshot, master=self.root)
         self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
 
         border_width = 4

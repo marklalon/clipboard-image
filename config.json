@@ -13,11 +13,60 @@
   },
   "overlay": {
     "enabled": true,
-    "x": 3230,
-    "y": 1214,
+    "x": 3247,
+    "y": 1219,
     "width": 182,
     "height": 145,
     "opacity": 0.85,
     "refresh_ms": 1000
+  },
+  "fan_control": {
+    "enabled": true,
+    "source": "mixed",
+    "interval_s": 2,
+    "curve": [
+      [
+        40,
+        30
+      ],
+      [
+        60,
+        50
+      ],
+      [
+        70,
+        75
+      ],
+      [
+        80,
+        100
+      ]
+    ],
+    "fan_indices": [],
+    "manual_pct": 50
+  },
+  "gpu_fan_control": {
+    "enabled": true,
+    "interval_s": 2,
+    "curve": [
+      [
+        40,
+        30
+      ],
+      [
+        60,
+        50
+      ],
+      [
+        70,
+        75
+      ],
+      [
+        80,
+        100
+      ]
+    ],
+    "source": "gpu_temp",
+    "manual_pct": 30
   }
 }

@@ -21,8 +21,10 @@ _nvml_handle    = None
 # --- LibreHardwareMonitor state ---
 _lhm_available = False
 _lhm_computer  = None
-_lhm_cpu_temp  = None  # ISensor reference
-_lhm_cpu_power = None  # ISensor reference
+_lhm_cpu_temp  = None   # ISensor reference
+_lhm_cpu_power = None   # ISensor reference
+_lhm_ram_temps = []     # list of ISensor references (one per DIMM)
+_lhm_lock      = threading.Lock()  # serialises all LHM .NET object access
 
 
 def init_nvml() -> bool:
@@ -50,8 +52,8 @@ def init_nvml() -> bool:
 
 
 def init_lhm() -> bool:
-    """Attempt to initialise LibreHardwareMonitorLib for CPU sensors. Call once at startup."""
-    global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power
+    """Attempt to initialise LibreHardwareMonitorLib for CPU/RAM sensors. Call once at startup."""
+    global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power, _lhm_ram_temps
     try:
         import clr
         # Find the DLL path
@@ -59,25 +61,26 @@ def init_lhm() -> bool:
         if not os.path.exists(dll_dir):
             log.debug(f"LibreHardwareMonitor DLLs not found at {dll_dir}")
             return False
-        
+
         # Add reference to the DLL
         clr.AddReference(os.path.join(dll_dir, "LibreHardwareMonitorLib.dll"))
         from LibreHardwareMonitor.Hardware import Computer
-        
+
         _lhm_computer = Computer()
         _lhm_computer.IsCpuEnabled = True
         _lhm_computer.IsGpuEnabled = False
-        _lhm_computer.IsMemoryEnabled = False
-        _lhm_computer.IsMotherboardEnabled = False
+        _lhm_computer.IsMemoryEnabled = True
+        _lhm_computer.IsMotherboardEnabled = True
         _lhm_computer.IsControllerEnabled = False
         _lhm_computer.IsNetworkEnabled = False
         _lhm_computer.IsStorageEnabled = False
         _lhm_computer.Open()
-        
-        # Find CPU temperature and power sensors
+
         for hardware in _lhm_computer.Hardware:
-            if hardware.HardwareType.ToString() == "Cpu":
-                hardware.Update()
+            hw_type = hardware.HardwareType.ToString()
+            hardware.Update()
+
+            if hw_type == "Cpu":
                 for sensor in hardware.Sensors:
                     sensor_type = sensor.SensorType.ToString()
                     name = sensor.Name.lower()
@@ -89,14 +92,37 @@ def init_lhm() -> bool:
                         if "package" in name or "cpu" in name:
                             _lhm_cpu_power = sensor
                             log.debug(f"Found CPU power sensor: {sensor.Name}")
-        
+
+            elif hw_type == "Memory":
+                for sub in list(hardware.SubHardware) + [hardware]:
+                    try:
+                        sub.Update()
+                    except Exception:
+                        pass
+                    for sensor in sub.Sensors:
+                        if sensor.SensorType.ToString() == "Temperature":
+                            _lhm_ram_temps.append(sensor)
+                            log.debug(f"Found RAM temp sensor: {sensor.Name}")
+
         _lhm_available = True
-        log.info("LibreHardwareMonitorLib initialised for CPU sensors")
+        log.info(
+            f"LibreHardwareMonitorLib initialised: CPU sensors found, "
+            f"{len(_lhm_ram_temps)} RAM temp sensor(s)"
+        )
         return True
     except Exception as e:
         log.warning(f"LibreHardwareMonitorLib init failed: {e}")
         _lhm_available = False
         return False
+
+
+def get_lhm_computer():
+    """Return (computer, lock) for fan_control to share the LHM instance."""
+    return _lhm_computer, _lhm_lock
+
+
+def lhm_is_available() -> bool:
+    return _lhm_available
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +174,7 @@ def get_system_stats() -> dict:
         "ram_used_gb":  None,
         "ram_total_gb": None,
         "ram_pct":      None,
+        "ram_temp_c":   None,
         "cpu_pct":      None,
         "cpu_temp_c":   None,
         "cpu_power_w":  None,
@@ -161,19 +188,35 @@ def get_system_stats() -> dict:
         # Use 0.1s interval for accurate measurement (blocks fetch thread briefly)
         result["cpu_pct"]      = psutil.cpu_percent(interval=0.1)
 
-        # CPU temperature/power via LibreHardwareMonitorLib
+        # CPU temperature/power and RAM temps via LibreHardwareMonitorLib
         if _lhm_available and _lhm_computer is not None:
             try:
-                # Update CPU hardware
-                for hardware in _lhm_computer.Hardware:
-                    if hardware.HardwareType.ToString() == "Cpu":
-                        hardware.Update()
-                        break
-                
-                if _lhm_cpu_temp is not None:
-                    result["cpu_temp_c"] = _lhm_cpu_temp.Value
-                if _lhm_cpu_power is not None:
-                    result["cpu_power_w"] = _lhm_cpu_power.Value
+                with _lhm_lock:
+                    for hardware in _lhm_computer.Hardware:
+                        hw_type = hardware.HardwareType.ToString()
+                        if hw_type == "Cpu":
+                            hardware.Update()
+                        elif hw_type == "Memory":
+                            hardware.Update()
+                            for sub in hardware.SubHardware:
+                                try:
+                                    sub.Update()
+                                except Exception:
+                                    pass
+                    cpu_temp  = _lhm_cpu_temp.Value  if _lhm_cpu_temp  is not None else None
+                    cpu_power = _lhm_cpu_power.Value if _lhm_cpu_power is not None else None
+                    ram_vals  = []
+                    for s in _lhm_ram_temps:
+                        try:
+                            v = s.Value
+                            if v is not None:
+                                ram_vals.append(float(v))
+                        except Exception:
+                            pass
+                result["cpu_temp_c"]  = cpu_temp
+                result["cpu_power_w"] = cpu_power
+                if ram_vals:
+                    result["ram_temp_c"] = sum(ram_vals) / len(ram_vals)
             except Exception as e:
                 log.debug(f"LHM sensor read error: {e}")
 
@@ -192,7 +235,7 @@ _TITLE_BG  = "#252525"
 _FG_NORMAL = "#00e676"
 _FG_WARM   = "#ffdd00"
 _FG_HOT    = "#ff4444"
-_FG_NA     = "#555555"
+_FG_NA     = "#777777"
 _FONT      = ("Consolas", 9)
 _FONT_BOLD = ("Consolas", 9, "bold")
 
@@ -219,9 +262,10 @@ class SystemMonitorOverlay:
     Runs inside its own tk.Tk() mainloop on a dedicated daemon thread.
     """
 
-    def __init__(self, config: dict, save_config_fn):
+    def __init__(self, config: dict, save_config_fn, on_close_fn=None):
         self.config        = config
         self.save_config   = save_config_fn
+        self._on_close_fn  = on_close_fn
         self._running      = False
         self._fetch_running = False
         self._q: queue.Queue = queue.Queue(maxsize=1)
@@ -266,8 +310,12 @@ class SystemMonitorOverlay:
                 self.root.after(0, self.root.destroy)
             except Exception:
                 pass
-        # Clear global instance so tray menu checkbox updates correctly
         _overlay_instance = None
+        if self._on_close_fn:
+            try:
+                self._on_close_fn()
+            except Exception:
+                pass
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -383,10 +431,13 @@ class SystemMonitorOverlay:
         cpu_color = _temp_color(s["cpu_temp_c"]) if s.get("cpu_temp_c") is not None else _FG_NORMAL
         self._set(self._labels["cpu"], "  ".join(cpu_parts) if cpu_parts else "N/A", cpu_color)
 
-        # RAM: used/total only, no percentage
+        # RAM: used/total [temp°C if available]
         if s.get("ram_used_gb") is not None:
-            self._set(self._labels["ram"],
-                      f"{s['ram_used_gb']:.1f}/{s['ram_total_gb']:.0f}GB", _FG_NORMAL)
+            ram_text = f"{s['ram_used_gb']:.1f}/{s['ram_total_gb']:.0f}GB"
+            if s.get("ram_temp_c") is not None:
+                ram_text += f"  {s['ram_temp_c']:.0f}°C"
+            ram_color = _temp_color(s.get("ram_temp_c")) if s.get("ram_temp_c") is not None else _FG_NORMAL
+            self._set(self._labels["ram"], ram_text, ram_color)
         else:
             self._set(self._labels["ram"], "N/A", _FG_NA)
 
@@ -461,14 +512,14 @@ class SystemMonitorOverlay:
 _overlay_instance: SystemMonitorOverlay | None = None
 
 
-def toggle_overlay(config: dict, save_config_fn) -> None:
+def toggle_overlay(config: dict, save_config_fn, on_close_fn=None) -> None:
     """Show or hide the overlay. Safe to call from any thread."""
     global _overlay_instance
     if _overlay_instance is not None:
         _overlay_instance.close()
         _overlay_instance = None
     else:
-        _overlay_instance = SystemMonitorOverlay(config, save_config_fn)
+        _overlay_instance = SystemMonitorOverlay(config, save_config_fn, on_close_fn=on_close_fn)
         threading.Thread(target=_overlay_instance.run, daemon=True).start()
 
 
@@ -482,3 +533,14 @@ def close_overlay() -> None:
 
 def overlay_is_open() -> bool:
     return _overlay_instance is not None
+
+
+def apply_overlay_opacity(opacity: float) -> None:
+    """Apply opacity to the running overlay immediately (no restart needed)."""
+    if _overlay_instance is not None and _overlay_instance.root is not None:
+        try:
+            _overlay_instance.root.after(
+                0, lambda: _overlay_instance.root.attributes("-alpha", opacity)
+            )
+        except Exception:
+            pass

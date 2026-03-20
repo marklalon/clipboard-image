@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
     "screenshot_hotkey": {"modifier": "alt", "key": "A"},
     "gpu_power_limit": {
         "enabled": False,
-        "watts": 150,
+        "watts": 300,
     },
     "overlay": {
         "enabled": False,   # auto-show on startup
@@ -24,6 +24,21 @@ DEFAULT_CONFIG = {
         "height": 200,
         "opacity": 0.85,
         "refresh_ms": 1000,
+    },
+    "fan_control": {
+        "enabled": False,
+        "source": "cpu_temp",   # "gpu_temp" | "cpu_temp" | "mixed" | "manual"
+        "interval_s": 2,
+        "manual_pct": 50,       # used when source == "manual"
+        "curve": [[40, 30], [60, 50], [70, 75], [80, 100]],
+        "fan_indices": [],      # [] = all fans; [0, 1] = filter by index
+    },
+    "gpu_fan_control": {
+        "enabled": False,
+        "source": "gpu_temp",   # "gpu_temp" | "manual"
+        "interval_s": 2,
+        "manual_pct": 50,
+        "curve": [[40, 30], [60, 50], [70, 75], [80, 100]],
     },
 }
 

@@ -29,6 +29,7 @@ import screenshot as screenshot_mod
 import hotkey
 import gpu_power
 import system_overlay
+import fan_control
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,7 +59,8 @@ if sys.stderr and hasattr(sys.stderr, "write"):
 # Propagate to sub-module loggers
 for _mod in ("little_helper.config", "little_helper.clipboard_paste",
              "little_helper.screenshot", "little_helper.hotkey",
-             "little_helper.gpu_power", "little_helper.system_overlay"):
+             "little_helper.gpu_power", "little_helper.system_overlay",
+             "little_helper.fan_control"):
     _ml = logging.getLogger(_mod)
     _ml.setLevel(logging.DEBUG)
     _ml.propagate = False
@@ -72,6 +74,7 @@ for _mod in ("little_helper.config", "little_helper.clipboard_paste",
 
 _config: dict    = {}
 _tray_icon       = None
+_settings_root   = None
 
 WM_CLOSE         = 0x0010
 _WINDOW_TITLE    = "LittleHelper_Hidden"
@@ -96,7 +99,14 @@ def _notify(message: str, title: str = "Little Helper") -> None:
 def _shutdown() -> None:
     """Unified cleanup: close overlay, restore GPU, stop hook."""
     log.info("Shutting down...")
+    if _settings_root is not None:
+        try:
+            _settings_root.destroy()
+        except Exception:
+            pass
     system_overlay.close_overlay()
+    fan_control.stop_fan_control()
+    fan_control.stop_gpu_fan_control()
     gpu_power.restore_gpu_power_limit()
     hotkey.stop_keyboard_hook()
 
@@ -155,14 +165,23 @@ def create_hidden_window() -> int:
 # ---------------------------------------------------------------------------
 
 def show_settings_dialog() -> None:
-    global _config
+    global _config, _settings_root
+
+    if _settings_root is not None:
+        try:
+            _settings_root.lift()
+            _settings_root.focus_force()
+        except Exception:
+            pass
+        return
 
     root = tk.Tk()
+    _settings_root = root
     root.title("Settings - Little Helper")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
-    width, height = 420, 480
+    width, height = 420, 780
     root.update_idletasks()
     x = (root.winfo_screenwidth()  // 2) - (width  // 2)
     y = (root.winfo_screenheight() // 2) - (height // 2)
@@ -189,11 +208,17 @@ def show_settings_dialog() -> None:
     paste_mod = tk.StringVar(master=root, value=_config["paste_hotkey"]["modifier"].capitalize())
     paste_key = tk.StringVar(master=root, value=_config["paste_hotkey"]["key"].upper())
 
+    def _make_key_entry(parent, var):
+        e = tk.Entry(parent, textvariable=var, width=5)
+        e.bind("<FocusIn>", lambda _: e.after(0, lambda: (e.select_range(0, "end"), e.icursor("end"))))
+        e.bind("<Key>", lambda ev: (var.set(ev.keysym.upper()[:1]) if len(ev.char) == 1 and ev.char.isprintable() else None) or "break")
+        return e
+
     row0 = tk.Frame(hk_frame)
     row0.pack(fill="x", pady=3)
     tk.Label(row0, text="Paste:", width=14, anchor="w").pack(side="left")
     tk.OptionMenu(row0, paste_mod, "Ctrl", "Alt").pack(side="left", padx=4)
-    tk.Entry(row0, textvariable=paste_key, width=5).pack(side="left")
+    _make_key_entry(row0, paste_key).pack(side="left")
 
     ss_mod = tk.StringVar(master=root, value=_config["screenshot_hotkey"]["modifier"].capitalize())
     ss_key = tk.StringVar(master=root, value=_config["screenshot_hotkey"]["key"].upper())
@@ -202,7 +227,15 @@ def show_settings_dialog() -> None:
     row1.pack(fill="x", pady=3)
     tk.Label(row1, text="Screenshot:", width=14, anchor="w").pack(side="left")
     tk.OptionMenu(row1, ss_mod, "Ctrl", "Alt").pack(side="left", padx=4)
-    tk.Entry(row1, textvariable=ss_key, width=5).pack(side="left")
+    _make_key_entry(row1, ss_key).pack(side="left")
+
+    def _apply_hotkey_modifiers(*_):
+        _config["paste_hotkey"]["modifier"]      = paste_mod.get().lower()
+        _config["screenshot_hotkey"]["modifier"] = ss_mod.get().lower()
+        cfg.save_config(_config)
+
+    paste_mod.trace_add("write", _apply_hotkey_modifiers)
+    ss_mod.trace_add("write", _apply_hotkey_modifiers)
 
     # ── Section 2: GPU Power Limit ────────────────────────────────────────
     gpu_frame = _section(outer, "GPU Power Limit  (Nvidia only)")
@@ -233,6 +266,15 @@ def show_settings_dialog() -> None:
     gpu_enabled.trace_add("write", _toggle_spin)
     _toggle_spin()
 
+    def _apply_gpu_power(*_):
+        _config["gpu_power_limit"]["enabled"] = gpu_enabled.get()
+        _config["gpu_power_limit"]["watts"]   = gpu_watts.get()
+        cfg.save_config(_config)
+        gpu_power.apply_gpu_power_limit(_config, notify_fn=_notify)
+
+    gpu_enabled.trace_add("write", _apply_gpu_power)
+    gpu_watts.trace_add("write", _apply_gpu_power)
+
     # ── Section 3: Overlay ────────────────────────────────────────────────
     ov_frame = _section(outer, "System Monitor Overlay")
 
@@ -257,29 +299,211 @@ def show_settings_dialog() -> None:
     tk.Spinbox(row6, from_=100, to=5000, increment=100,
                textvariable=ov_refresh, width=6).pack(side="left", padx=4)
 
-    # ── Buttons ───────────────────────────────────────────────────────────
-    def on_save():
-        global _config
-        _config["paste_hotkey"]["modifier"]      = paste_mod.get().lower()
-        _config["paste_hotkey"]["key"]            = paste_key.get().upper()
-        _config["screenshot_hotkey"]["modifier"]  = ss_mod.get().lower()
-        _config["screenshot_hotkey"]["key"]       = ss_key.get().upper()
-        _config["gpu_power_limit"]["enabled"]     = gpu_enabled.get()
-        _config["gpu_power_limit"]["watts"]       = gpu_watts.get()
-        _config["overlay"]["enabled"]             = ov_enabled.get()
-        _config["overlay"]["opacity"]             = round(ov_opacity.get(), 2)
-        _config["overlay"]["refresh_ms"]          = ov_refresh.get()
-
+    def _apply_overlay(*_):
+        _config["overlay"]["enabled"]    = ov_enabled.get()
+        _config["overlay"]["opacity"]    = round(ov_opacity.get(), 2)
+        _config["overlay"]["refresh_ms"] = ov_refresh.get()
         cfg.save_config(_config)
-        # Re-apply GPU limit with new settings
-        gpu_power.apply_gpu_power_limit(_config, notify_fn=_notify)
-        root.destroy()
-        _notify("Settings saved.", "Settings")
+        system_overlay.apply_overlay_opacity(_config["overlay"]["opacity"])
 
-    btn_frame = tk.Frame(outer)
-    btn_frame.pack(pady=18)
-    tk.Button(btn_frame, text="Save",   width=10, command=on_save ).pack(side="left", padx=8)
-    tk.Button(btn_frame, text="Cancel", width=10, command=root.destroy).pack(side="left", padx=8)
+    ov_enabled.trace_add("write", _apply_overlay)
+    ov_opacity.trace_add("write", _apply_overlay)
+    ov_refresh.trace_add("write", _apply_overlay)
+
+    # ── Section 4: CPU Fan Control ────────────────────────────────────────
+    fc_frame = _section(outer, "CPU Fan Control")
+
+    fc_cfg      = _config.get("fan_control", {})
+    fc_enabled  = tk.BooleanVar(master=root, value=fc_cfg.get("enabled", False))
+    fc_source   = tk.StringVar(master=root, value=fc_cfg.get("source", "gpu_temp"))
+    fc_interval = tk.IntVar(   master=root, value=fc_cfg.get("interval_s", 3))
+    fc_manual   = tk.DoubleVar(master=root, value=fc_cfg.get("manual_pct", 50))
+
+    row_fc0 = tk.Frame(fc_frame)
+    row_fc0.pack(fill="x", pady=3)
+    tk.Checkbutton(row_fc0, text="Enable on startup", variable=fc_enabled).pack(side="left")
+
+    row_fc1 = tk.Frame(fc_frame)
+    row_fc1.pack(fill="x", pady=3)
+    tk.Label(row_fc1, text="Source:", width=14, anchor="w").pack(side="left")
+    tk.OptionMenu(row_fc1, fc_source, "cpu_temp", "gpu_temp", "mixed", "manual").pack(
+        side="left", padx=4
+    )
+
+    row_fc2 = tk.Frame(fc_frame)
+    row_fc2.pack(fill="x", pady=3)
+    tk.Label(row_fc2, text="Interval (s):", width=14, anchor="w").pack(side="left")
+    tk.Spinbox(row_fc2, from_=1, to=60, increment=1,
+               textvariable=fc_interval, width=5).pack(side="left", padx=4)
+
+    # Manual fan speed slider (only visible when source == "manual")
+    row_fc3 = tk.Frame(fc_frame)
+    manual_pct_label = tk.Label(row_fc3, text="Fan speed:", width=14, anchor="w")
+    manual_pct_label.pack(side="left")
+    manual_val_label = tk.Label(row_fc3, text=f"{int(fc_manual.get())}%", width=5, anchor="w")
+
+    def _on_manual_slider(val):
+        # Only update the display label; fan speed is applied by the poll loop
+        manual_val_label.configure(text=f"{int(float(val))}%")
+
+    manual_slider = tk.Scale(
+        row_fc3, variable=fc_manual, from_=0, to=100, resolution=1,
+        orient="horizontal", length=180, showvalue=False, command=_on_manual_slider,
+    )
+    manual_slider.pack(side="left", padx=4)
+    manual_val_label.pack(side="left")
+
+    # Poll slider value every 400 ms and push to fan control when in manual mode
+    _poll_id = [None]
+
+    def _poll_manual():
+        if fc_source.get() == "manual":
+            fan_control.set_manual_pct(float(fc_manual.get()))
+        _poll_id[0] = root.after(400, _poll_manual)
+
+    _poll_manual()
+
+    def _apply_source_immediately(*_):
+        source = fc_source.get()
+        if source == "manual":
+            row_fc3.pack(fill="x", pady=3)
+        else:
+            row_fc3.pack_forget()
+        _config["fan_control"]["source"] = source
+        cfg.save_config(_config)
+        if fan_control.fan_control_is_active():
+            fan_control.stop_fan_control()
+            lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+            if lhm_computer is not None:
+                fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+
+    fc_source.trace_add("write", _apply_source_immediately)
+    _apply_source_immediately()  # set initial visibility
+
+    def _apply_fc_enabled(*_):
+        _config["fan_control"]["enabled"] = fc_enabled.get()
+        cfg.save_config(_config)
+        if fc_enabled.get():
+            if not fan_control.fan_control_is_active():
+                lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+                if lhm_computer is not None:
+                    fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+        else:
+            fan_control.stop_fan_control()
+
+    fc_enabled.trace_add("write", _apply_fc_enabled)
+
+    def _apply_fc_interval(*_):
+        _config["fan_control"]["interval_s"] = fc_interval.get()
+        cfg.save_config(_config)
+        if fan_control.fan_control_is_active():
+            fan_control.stop_fan_control()
+            lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+            if lhm_computer is not None:
+                fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+
+    fc_interval.trace_add("write", _apply_fc_interval)
+
+    # ── Section 5: GPU Fan Control ────────────────────────────────────────
+    gfc_frame = _section(outer, "GPU Fan Control  (Nvidia only)")
+
+    gfc_cfg      = _config.get("gpu_fan_control", {})
+    gfc_enabled  = tk.BooleanVar(master=root, value=gfc_cfg.get("enabled", False))
+    gfc_source   = tk.StringVar( master=root, value=gfc_cfg.get("source", "gpu_temp"))
+    gfc_interval = tk.IntVar(    master=root, value=gfc_cfg.get("interval_s", 2))
+    gfc_manual   = tk.DoubleVar( master=root, value=gfc_cfg.get("manual_pct", 50))
+
+    row_gfc0 = tk.Frame(gfc_frame)
+    row_gfc0.pack(fill="x", pady=3)
+    tk.Checkbutton(row_gfc0, text="Enable on startup", variable=gfc_enabled).pack(side="left")
+
+    row_gfc1 = tk.Frame(gfc_frame)
+    row_gfc1.pack(fill="x", pady=3)
+    tk.Label(row_gfc1, text="Source:", width=14, anchor="w").pack(side="left")
+    tk.OptionMenu(row_gfc1, gfc_source, "gpu_temp", "manual").pack(side="left", padx=4)
+
+    row_gfc2 = tk.Frame(gfc_frame)
+    row_gfc2.pack(fill="x", pady=3)
+    tk.Label(row_gfc2, text="Interval (s):", width=14, anchor="w").pack(side="left")
+    tk.Spinbox(row_gfc2, from_=1, to=60, increment=1,
+               textvariable=gfc_interval, width=5).pack(side="left", padx=4)
+
+    # Manual slider (only visible when source == "manual")
+    row_gfc3 = tk.Frame(gfc_frame)
+    gfc_manual_pct_label = tk.Label(row_gfc3, text="Fan speed:", width=14, anchor="w")
+    gfc_manual_pct_label.pack(side="left")
+    gfc_manual_val_label = tk.Label(row_gfc3, text=f"{int(gfc_manual.get())}%", width=5, anchor="w")
+
+    def _on_gfc_manual_slider(val):
+        gfc_manual_val_label.configure(text=f"{int(float(val))}%")
+
+    gfc_manual_slider = tk.Scale(
+        row_gfc3, variable=gfc_manual, from_=0, to=100, resolution=1,
+        orient="horizontal", length=180, showvalue=False, command=_on_gfc_manual_slider,
+    )
+    gfc_manual_slider.pack(side="left", padx=4)
+    gfc_manual_val_label.pack(side="left")
+
+    _gfc_poll_id = [None]
+
+    def _poll_gfc_manual():
+        if gfc_source.get() == "manual":
+            fan_control.set_gpu_manual_pct(float(gfc_manual.get()))
+        _gfc_poll_id[0] = root.after(400, _poll_gfc_manual)
+
+    _poll_gfc_manual()
+
+    def _apply_gfc_source_immediately(*_):
+        source = gfc_source.get()
+        if source == "manual":
+            row_gfc3.pack(fill="x", pady=3)
+        else:
+            row_gfc3.pack_forget()
+        _config["gpu_fan_control"]["source"] = source
+        cfg.save_config(_config)
+        if fan_control.gpu_fan_control_is_active():
+            fan_control.stop_gpu_fan_control()
+            fan_control.start_gpu_fan_control(_config)
+
+    gfc_source.trace_add("write", _apply_gfc_source_immediately)
+    _apply_gfc_source_immediately()  # set initial visibility
+
+    def _apply_gfc_enabled(*_):
+        _config["gpu_fan_control"]["enabled"] = gfc_enabled.get()
+        cfg.save_config(_config)
+        if gfc_enabled.get():
+            if not fan_control.gpu_fan_control_is_active():
+                fan_control.start_gpu_fan_control(_config)
+        else:
+            fan_control.stop_gpu_fan_control()
+
+    gfc_enabled.trace_add("write", _apply_gfc_enabled)
+
+    def _apply_gfc_interval(*_):
+        _config["gpu_fan_control"]["interval_s"] = gfc_interval.get()
+        cfg.save_config(_config)
+        if fan_control.gpu_fan_control_is_active():
+            fan_control.stop_gpu_fan_control()
+            fan_control.start_gpu_fan_control(_config)
+
+    gfc_interval.trace_add("write", _apply_gfc_interval)
+
+    # ── Close: save key fields and slider defaults ────────────────────────
+    def _close():
+        global _settings_root
+        _config["paste_hotkey"]["key"]           = paste_key.get().upper()
+        _config["screenshot_hotkey"]["key"]      = ss_key.get().upper()
+        _config["fan_control"]["manual_pct"]     = int(fc_manual.get())
+        _config["gpu_fan_control"]["manual_pct"] = int(gfc_manual.get())
+        cfg.save_config(_config)
+        if _poll_id[0]:
+            root.after_cancel(_poll_id[0])
+        if _gfc_poll_id[0]:
+            root.after_cancel(_gfc_poll_id[0])
+        _settings_root = None
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _close)
 
     root.mainloop()
 
@@ -307,8 +531,29 @@ def create_tray_icon() -> None:
         threading.Thread(
             target=system_overlay.toggle_overlay,
             args=(_config, cfg.save_config),
+            kwargs={"on_close_fn": icon.update_menu},
             daemon=True,
         ).start()
+
+    def _on_toggle_fan_control(icon, item):
+        if fan_control.fan_control_is_active():
+            fan_control.stop_fan_control()
+        else:
+            lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+            if lhm_computer is not None:
+                fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+            else:
+                _notify(
+                    "LibreHardwareMonitor not available.\n"
+                    "CPU fan control requires LHM to be initialised.",
+                    "CPU Fan Control",
+                )
+
+    def _on_toggle_gpu_fan_control(icon, item):
+        if fan_control.gpu_fan_control_is_active():
+            fan_control.stop_gpu_fan_control()
+        else:
+            fan_control.start_gpu_fan_control(_config)
 
     def _get_hotkey_display():
         p = _config["paste_hotkey"]
@@ -325,8 +570,18 @@ def create_tray_icon() -> None:
             _on_toggle_overlay,
             checked=lambda item: system_overlay.overlay_is_open(),
         ),
+        pystray.MenuItem(
+            "CPU Fan Control",
+            _on_toggle_fan_control,
+            checked=lambda item: fan_control.fan_control_is_enabled(),
+        ),
+        pystray.MenuItem(
+            "GPU Fan Control",
+            _on_toggle_gpu_fan_control,
+            checked=lambda item: fan_control.gpu_fan_control_is_enabled(),
+        ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Settings", _on_settings),
+        pystray.MenuItem("Settings", _on_settings, default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", _on_exit),
     )
@@ -352,13 +607,29 @@ def create_tray_icon() -> None:
         icon.visible = True
         # Apply GPU power limit after tray is visible (so notify works)
         gpu_power.apply_gpu_power_limit(_config, notify_fn=_notify)
+        # Sync manual_pct from config into the module
+        fan_control.set_manual_pct(_config.get("fan_control", {}).get("manual_pct", 50))
+        fan_control.set_gpu_manual_pct(_config.get("gpu_fan_control", {}).get("manual_pct", 50))
+        # Auto-start CPU fan control if configured
+        if _config.get("fan_control", {}).get("enabled", False):
+            lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+            if lhm_computer is not None:
+                fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+            else:
+                log.warning("CPU fan control enabled in config but LHM is not available")
+        # Auto-start GPU fan control if configured
+        if _config.get("gpu_fan_control", {}).get("enabled", False):
+            fan_control.start_gpu_fan_control(_config)
         # Auto-open overlay if configured
         if _config.get("overlay", {}).get("enabled", False):
             threading.Thread(
                 target=system_overlay.toggle_overlay,
                 args=(_config, cfg.save_config),
+                kwargs={"on_close_fn": icon.update_menu},
                 daemon=True,
             ).start()
+        # Refresh tray menu checkmarks after all state has been set
+        icon.update_menu()
 
     log.info("Starting tray icon...")
     icon.run(setup=on_setup)
