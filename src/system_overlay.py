@@ -6,6 +6,7 @@ Runs in its own daemon thread with a Tkinter mainloop.
 """
 
 import os
+import sys
 import queue
 import threading
 import logging
@@ -56,8 +57,11 @@ def init_lhm() -> bool:
     global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power, _lhm_ram_temps
     try:
         import clr
-        # Find the DLL path
-        dll_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "lib", "lhm")
+        # Find the DLL path (works for both source and PyInstaller frozen EXE)
+        if getattr(sys, 'frozen', False):
+            dll_dir = os.path.join(sys._MEIPASS, "lhm")
+        else:
+            dll_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "lib", "lhm")
         if not os.path.exists(dll_dir):
             log.debug(f"LibreHardwareMonitor DLLs not found at {dll_dir}")
             return False
