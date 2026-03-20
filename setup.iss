@@ -20,7 +20,7 @@ SetupIconFile=res\icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 
@@ -29,7 +29,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "Launch at startup"; GroupDescription: "Options:"; Flags: unchecked
+Name: "autostart"; Description: "Launch at startup (no UAC prompt)"; GroupDescription: "Options:"
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -42,11 +42,44 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\icon.ico"
 
 [Registry]
-; Auto-start with Windows
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "LittleHelper"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: autostart; Flags: uninsdeletevalue
+; (autostart is handled via Task Scheduler, not registry Run key, to avoid UAC prompt)
+
+[Code]
+procedure CreateStartupTask();
+var
+  ResultCode: Integer;
+begin
+  Exec('schtasks.exe',
+    '/create /tn "LittleHelper" /tr "\"' + ExpandConstant('{app}\{#MyAppExeName}') + '\""' +
+    ' /sc ONLOGON /rl HIGHEST /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure DeleteStartupTask();
+var
+  ResultCode: Integer;
+begin
+  Exec('schtasks.exe', '/delete /tn "LittleHelper" /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('autostart') then
+      CreateStartupTask();
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    DeleteStartupTask();
+end;
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"

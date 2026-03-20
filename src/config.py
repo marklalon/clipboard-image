@@ -2,6 +2,7 @@
 Little Helper - Configuration management and path utilities.
 """
 
+import copy
 import os
 import sys
 import json
@@ -17,7 +18,7 @@ DEFAULT_CONFIG = {
         "watts": 300,
     },
     "overlay": {
-        "enabled": False,   # auto-show on startup
+        "enabled": True,   # auto-show on startup
         "x": -1,            # -1 = auto top-right corner
         "y": -1,
         "width": 220,
@@ -26,15 +27,15 @@ DEFAULT_CONFIG = {
         "refresh_ms": 1000,
     },
     "fan_control": {
-        "enabled": False,
-        "source": "cpu_temp",   # "gpu_temp" | "cpu_temp" | "mixed" | "manual"
+        "enabled": True,
+        "source": "mixed",   # "gpu_temp" | "cpu_temp" | "mixed" | "manual"
         "interval_s": 2,
         "manual_pct": 50,       # used when source == "manual"
         "curve": [[40, 30], [60, 50], [70, 75], [80, 100]],
         "fan_indices": [],      # [] = all fans; [0, 1] = filter by index
     },
     "gpu_fan_control": {
-        "enabled": False,
+        "enabled": True,
         "source": "gpu_temp",   # "gpu_temp" | "manual"
         "interval_s": 2,
         "manual_pct": 50,
@@ -90,7 +91,7 @@ def load_config() -> dict:
             return config
     except Exception as e:
         log.error(f"Error loading config: {e}")
-    return DEFAULT_CONFIG.copy()
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(config: dict) -> None:
