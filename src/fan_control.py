@@ -71,6 +71,14 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
                                 pass
                         rpm_name = rpm_sensor.Name if rpm_sensor else ""
 
+                        # Skip fans with RPM=0 (disconnected headers)
+                        if rpm_val is not None and rpm_val == 0:
+                            log.info(
+                                f"Skipping {sensor.Name} on {sub_hw.Name} "
+                                f"(RPM=0, disconnected)"
+                            )
+                            continue
+
                         # Skip pumps (high RPM headers)
                         if rpm_val is not None and rpm_val >= 3000:
                             log.info(
