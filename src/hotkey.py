@@ -7,6 +7,8 @@ import ctypes.wintypes
 import threading
 import logging
 
+from clipboard_paste import should_skip_paste
+
 log = logging.getLogger("little_helper.hotkey")
 
 # --- Win32 constants ---
@@ -130,8 +132,13 @@ def start_keyboard_hook(config: dict, on_paste_fn, on_screenshot_fn) -> None:
                     if now - _last_paste_t >= _HOTKEY_COOLDOWN:
                         _last_paste_t = now
                         hotkey_str = f"{paste_mod.capitalize()}+{config['paste_hotkey']['key'].upper()}"
-                        log.debug(f"{hotkey_str} detected via hook")
-                        threading.Thread(target=on_paste_fn, daemon=True).start()
+                        
+                        # Check if we should skip paste in editable contexts
+                        if should_skip_paste():
+                            log.debug(f"{hotkey_str} detected but skipping - in editable context")
+                        else:
+                            log.debug(f"{hotkey_str} detected via hook")
+                            threading.Thread(target=on_paste_fn, daemon=True).start()
 
                 # Accept SYSKEYDOWN too so Alt+X fires when another window has focus
                 screenshot_mod_ok = (ctrl_down and screenshot_mod == "ctrl") or \

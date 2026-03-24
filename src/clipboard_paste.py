@@ -1,5 +1,6 @@
 """
 Little Helper - Clipboard image paste and Explorer path detection.
+Provides functions to detect clipboard images and paste them to Explorer windows.
 """
 
 import os
@@ -8,14 +9,111 @@ import urllib.parse
 from datetime import datetime
 from io import BytesIO
 
+import ctypes
+import ctypes.wintypes
+
 import pythoncom
 import win32gui
 import win32com.client
 import win32clipboard
 import win32con
+import win32process
 from PIL import Image, ImageGrab
 
 log = logging.getLogger("little_helper.clipboard_paste")
+
+# Window class names that indicate editable input fields (non-Explorer)
+EDITABLE_WINDOW_CLASSES = {
+    "Edit",
+    "RichEdit20W",
+    "RichEdit50W",
+    "DirectUIHost",
+    "Chrome_RenderWidgetHostHWND",
+    "Chrome_WidgetWin_1",
+    "MozillaWindowClass",
+    "Internet Explorer_Server",
+}
+
+# Explorer address bar / search box focused-child classes
+EXPLORER_EDITABLE_CLASSES = {
+    "Edit",
+    "ComboBox",
+    "SearchEditBoxWrapperClass",
+    "ToolbarWindow32",
+    "Address Band Root",
+}
+
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("flags", ctypes.wintypes.DWORD),
+        ("hwndActive", ctypes.wintypes.HWND),
+        ("hwndFocus", ctypes.wintypes.HWND),
+        ("hwndCapture", ctypes.wintypes.HWND),
+        ("hwndMenuOwner", ctypes.wintypes.HWND),
+        ("hwndMoveSize", ctypes.wintypes.HWND),
+        ("hwndCaret", ctypes.wintypes.HWND),
+        ("rcCaret", ctypes.wintypes.RECT),
+    ]
+
+
+def _get_focused_child(hwnd: int) -> int:
+    """
+    Get the focused child window of *hwnd* via GetGUIThreadInfo.
+    Works across threads (unlike GetFocus).  Returns 0 on failure.
+    """
+    try:
+        tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if ctypes.windll.user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            fh = info.hwndFocus
+            if fh and fh != hwnd:
+                return fh
+    except Exception as e:
+        log.debug(f"_get_focused_child error: {e}")
+    return 0
+
+
+def should_skip_paste() -> bool:
+    """
+    Return True when the user is typing in an input field and the
+    normal Ctrl+V should be left alone (address bar, search box, browser, etc.).
+    """
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return False
+
+    cls = win32gui.GetClassName(hwnd)
+
+    # --- Explorer window --------------------------------------------------
+    if cls in ("CabinetWClass", "ExploreWClass"):
+        focus = _get_focused_child(hwnd)
+        if focus:
+            fcls = win32gui.GetClassName(focus)
+            log.debug(f"Explorer focused child: hwnd={focus}, class={fcls}")
+            if fcls in EXPLORER_EDITABLE_CLASSES:
+                log.debug("Explorer editable control focused – skip paste")
+                return True
+            # Modern address bar uses DirectUIHWND inside an "Address" band
+            if fcls == "DirectUIHWND":
+                parent = win32gui.GetParent(focus)
+                while parent and parent != hwnd:
+                    pcls = win32gui.GetClassName(parent)
+                    if "Address" in pcls or "Search" in pcls or "Breadcrumb" in pcls:
+                        log.debug("Modern address bar focused – skip paste")
+                        return True
+                    parent = win32gui.GetParent(parent)
+        log.debug("Explorer file-list focused – allow paste")
+        return False
+
+    # --- Non-Explorer: check if it's an editable window class -------------
+    if cls in EDITABLE_WINDOW_CLASSES:
+        log.debug(f"Editable window class {cls} – skip paste")
+        return True
+
+    return False
 
 
 def get_explorer_path() -> str | None:
@@ -129,6 +227,14 @@ def copy_image_to_clipboard(img: Image.Image) -> None:
 def on_paste(config: dict, notify_fn=None) -> None:
     """Handle paste hotkey: save clipboard image to active Explorer directory."""
     log.debug("on_paste triggered")
+    
+    # Check if we should skip paste in editable contexts
+    skip_result = should_skip_paste()
+    log.debug(f"DEBUG: should_skip_paste() returned {skip_result}")
+    if skip_result:
+        log.debug("Skipping paste in editable context - allowing normal Ctrl+V")
+        return
+    
     try:
         img = get_clipboard_image()
         if img is None:
