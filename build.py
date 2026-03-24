@@ -29,6 +29,7 @@ def clean():
 def build():
     """Build executable with PyInstaller."""
     icon_path = os.path.join(SCRIPT_DIR, "res", "icon.ico")
+    lhm_zip = os.path.join(SCRIPT_DIR, "lib", "lhm.zip")
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -37,6 +38,7 @@ def build():
         "--windowed",  # No console window
         f"--icon={icon_path}",
         f"--add-data={icon_path};.",  # Include icon.ico in the bundle
+        f"--add-data={lhm_zip};lhm",  # Include LHM library
         "--hidden-import=PIL._tkinter_finder",
         "--hidden-import=win32timezone",
         "--hidden-import=psutil",
@@ -48,6 +50,7 @@ def build():
         "--hidden-import=hotkey",
         "--hidden-import=gpu_power",
         "--hidden-import=system_overlay",
+        "--hidden-import=librehardwaremonitor",
         os.path.join(SCRIPT_DIR, "src", "main.pyw"),
     ]
     
