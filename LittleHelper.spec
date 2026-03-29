@@ -1,16 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('D:\\AI\\little-helper\\res\\icon.ico', '.'), ('D:\\AI\\little-helper\\lib\\lhm.zip', 'lhm')]
+datas = [
+    ('D:\\AI\\little-helper\\res\\icon.ico', '.'),
+    ('D:\\AI\\little-helper\\lib\\lhm', 'lhm'),
+]
 binaries = []
-hiddenimports = ['PIL._tkinter_finder', 'win32timezone', 'psutil', 'pynvml', 'config', 'clipboard_paste', 'screenshot', 'hotkey', 'gpu_power', 'system_overlay', 'librehardwaremonitor']
+hiddenimports = [
+    'PIL._tkinter_finder',
+    'win32timezone',
+    'psutil',
+    'pynvml',
+    'clr',
+    'clr._extra',
+    'Python.Runtime',
+    'config',
+    'clipboard_paste',
+    'screenshot',
+    'hotkey',
+    'gpu_power',
+    'system_overlay',
+    'fan_control',
+]
 tmp_ret = collect_all('wmi')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['D:\\AI\\little-helper\\src\\main.pyw'],
-    pathex=[],
+    pathex=['D:\\AI\\little-helper\\src'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

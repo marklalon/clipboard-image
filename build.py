@@ -11,6 +11,7 @@ import subprocess
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(SCRIPT_DIR, "dist")
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
+INNO_SETUP = r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
 
 def clean():
@@ -19,41 +20,20 @@ def clean():
         if os.path.exists(path):
             shutil.rmtree(path)
             print(f"Removed: {path}")
-    
-    spec_file = os.path.join(SCRIPT_DIR, "LittleHelper.spec")
-    if os.path.exists(spec_file):
-        os.remove(spec_file)
-        print(f"Removed: {spec_file}")
 
 
 def build():
-    """Build executable with PyInstaller."""
-    icon_path = os.path.join(SCRIPT_DIR, "res", "icon.ico")
-    lhm_zip = os.path.join(SCRIPT_DIR, "lib", "lhm.zip")
+    """Build executable with PyInstaller using LittleHelper.spec."""
+    spec_file = os.path.join(SCRIPT_DIR, "LittleHelper.spec")
+    if not os.path.exists(spec_file):
+        print(f"ERROR: {spec_file} not found!")
+        return None
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name=LittleHelper",
-        "--onefile",
-        "--windowed",  # No console window
-        f"--icon={icon_path}",
-        f"--add-data={icon_path};.",  # Include icon.ico in the bundle
-        f"--add-data={lhm_zip};lhm",  # Include LHM library
-        "--hidden-import=PIL._tkinter_finder",
-        "--hidden-import=win32timezone",
-        "--hidden-import=psutil",
-        "--hidden-import=pynvml",
-        "--collect-all=wmi",        # wmi needs full collect for its extensions
-        "--hidden-import=config",
-        "--hidden-import=clipboard_paste",
-        "--hidden-import=screenshot",
-        "--hidden-import=hotkey",
-        "--hidden-import=gpu_power",
-        "--hidden-import=system_overlay",
-        "--hidden-import=librehardwaremonitor",
-        os.path.join(SCRIPT_DIR, "src", "main.pyw"),
+        spec_file,
     ]
-    
+
     print("Running PyInstaller...")
     print(" ".join(cmd))
     subprocess.run(cmd, cwd=SCRIPT_DIR, check=True)
@@ -80,11 +60,34 @@ def main():
     exe_path = build()
     
     if exe_path:
-        print("\n" + "=" * 50)
-        print("Build complete!")
-        print(f"Executable: {exe_path}")
-        print("\nNext step: Run Inno Setup on setup.iss to create installer")
-        print("=" * 50)
+        build_installer()
+
+    print("\n" + "=" * 50)
+    print("All done!" if exe_path else "Build failed!")
+    print("=" * 50)
+
+
+def build_installer():
+    """Run Inno Setup to create the installer."""
+    iss_file = os.path.join(SCRIPT_DIR, "setup.iss")
+    if not os.path.exists(iss_file):
+        print("setup.iss not found, skipping installer.")
+        return
+
+    if not os.path.exists(INNO_SETUP):
+        print(f"Inno Setup not found at: {INNO_SETUP}")
+        print("Skipping installer creation.")
+        return
+
+    installer_dir = os.path.join(SCRIPT_DIR, "installer")
+    os.makedirs(installer_dir, exist_ok=True)
+
+    print("\nRunning Inno Setup...")
+    subprocess.run([INNO_SETUP, iss_file], cwd=SCRIPT_DIR, check=True)
+
+    installer = os.path.join(installer_dir, "LittleHelper-Setup.exe")
+    if os.path.exists(installer):
+        print(f"Installer: {installer}")
 
 
 if __name__ == "__main__":
