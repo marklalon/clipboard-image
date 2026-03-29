@@ -36,8 +36,16 @@ import fan_control
 # ---------------------------------------------------------------------------
 
 LOG_PATH = cfg.get_log_path()
+
+# Rotate previous log instead of clearing it, so crash logs are preserved
+_bak_path = LOG_PATH + ".bak"
 if os.path.exists(LOG_PATH):
-    open(LOG_PATH, "w", encoding="utf-8").close()
+    try:
+        if os.path.exists(_bak_path):
+            os.remove(_bak_path)
+        os.rename(LOG_PATH, _bak_path)
+    except Exception:
+        open(LOG_PATH, "w", encoding="utf-8").close()
 
 logging.getLogger().setLevel(logging.WARNING)
 
@@ -50,12 +58,6 @@ _fh.setLevel(logging.DEBUG)
 _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s"))
 log.addHandler(_fh)
 
-if sys.stderr and hasattr(sys.stderr, "write"):
-    _sh = logging.StreamHandler(sys.stderr)
-    _sh.setLevel(logging.DEBUG)
-    _sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s"))
-    log.addHandler(_sh)
-
 # Propagate to sub-module loggers
 for _mod in ("little_helper.config", "little_helper.clipboard_paste",
              "little_helper.screenshot", "little_helper.hotkey",
@@ -65,8 +67,23 @@ for _mod in ("little_helper.config", "little_helper.clipboard_paste",
     _ml.setLevel(logging.DEBUG)
     _ml.propagate = False
     _ml.addHandler(_fh)
-    if sys.stderr and hasattr(sys.stderr, "write"):
-        _ml.addHandler(_sh)
+
+
+def _log_unhandled(exc_type, exc_value, exc_tb):
+    log.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+    _fh.flush()
+
+
+def _log_thread_exception(args):
+    log.critical(
+        f"Unhandled exception in thread {args.thread!r}",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+    _fh.flush()
+
+
+sys.excepthook = _log_unhandled
+threading.excepthook = _log_thread_exception
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -523,6 +540,16 @@ def show_settings_dialog() -> None:
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _close)
+
+    # ── Bottom buttons ────────────────────────────────────────────────────
+    btn_frame = tk.Frame(outer, pady=6)
+    btn_frame.pack(fill="x")
+
+    def _open_config():
+        import subprocess
+        subprocess.Popen(["notepad.exe", cfg.get_config_path()])
+
+    tk.Button(btn_frame, text="Open config.json", command=_open_config).pack(side="left")
 
     # All widgets built — allow trace callbacks to fire from now on
     _initing[0] = False
