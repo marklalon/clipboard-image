@@ -187,6 +187,21 @@ def generate_filename(directory: str) -> str:
         counter += 1
 
 
+def has_clipboard_file_paths() -> bool:
+    """Check if clipboard contains file paths (not image data)."""
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            # CF_HDROP (15) is the standard format for file lists
+            # If this format exists, it means files are in clipboard
+            return win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception as e:
+        log.debug(f"Error checking clipboard formats: {e}")
+        return False
+
+
 def get_clipboard_image() -> Image.Image | None:
     """Return PIL Image from clipboard, or None."""
     img = ImageGrab.grabclipboard()
@@ -227,6 +242,12 @@ def copy_image_to_clipboard(img: Image.Image) -> None:
 def on_paste(config: dict, notify_fn=None) -> None:
     """Handle paste hotkey: save clipboard image to active Explorer directory."""
     log.debug("on_paste triggered")
+    
+    # Check if clipboard contains file paths (not image data)
+    # If yes, Windows will handle it, so skip to avoid duplicate files
+    if has_clipboard_file_paths():
+        log.debug("Clipboard contains file paths - letting Windows handle paste")
+        return
     
     # Check if we should skip paste in editable contexts
     skip_result = should_skip_paste()

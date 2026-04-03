@@ -3,6 +3,7 @@ __pycache__/
 *.log
 *.bak
 .claude
+.vscode/
 
 # Build artifacts
 build/
