@@ -41,6 +41,14 @@ DEFAULT_CONFIG = {
         "manual_pct": 50,
         "curve": [[40, 30], [60, 50], [70, 70], [85, 100]],
     },
+    "auto_sleep": {
+        "enabled": False,
+        "idle_seconds": 300,
+        "cpu_threshold": 1,          # % utilization
+        "gpu_threshold": 1,          # % utilization
+        "disk_threshold_mbps": 1.0,  # MB/s
+        "countdown_seconds": 30,
+    },
 }
 
 

@@ -17,6 +17,7 @@ except Exception:
 import threading
 import logging
 import time
+import queue
 
 import tkinter as tk
 import pystray
@@ -30,6 +31,7 @@ import hotkey
 import gpu_power
 import system_overlay
 import fan_control
+import auto_sleep
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,7 +64,7 @@ log.addHandler(_fh)
 for _mod in ("little_helper.config", "little_helper.clipboard_paste",
              "little_helper.screenshot", "little_helper.hotkey",
              "little_helper.gpu_power", "little_helper.system_overlay",
-             "little_helper.fan_control"):
+             "little_helper.fan_control", "little_helper.auto_sleep"):
     _ml = logging.getLogger(_mod)
     _ml.setLevel(logging.DEBUG)
     _ml.propagate = False
@@ -92,6 +94,10 @@ threading.excepthook = _log_thread_exception
 _config: dict    = {}
 _tray_icon       = None
 _settings_root   = None
+_ui_root         = None
+_ui_thread       = None
+_ui_ready        = threading.Event()
+_ui_tasks: queue.Queue = queue.Queue()
 
 WM_CLOSE         = 0x0010
 _WINDOW_TITLE    = "LittleHelper_Hidden"
@@ -110,22 +116,135 @@ def _notify(message: str, title: str = "Little Helper") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shared Tk UI thread
+# ---------------------------------------------------------------------------
+
+def _run_ui_loop() -> None:
+    global _ui_root
+
+    def _drain_ui_tasks() -> None:
+        try:
+            while True:
+                callback = _ui_tasks.get_nowait()
+                callback()
+        except queue.Empty:
+            pass
+
+        if _ui_root is not None:
+            _ui_root.after(20, _drain_ui_tasks)
+
+    root = tk.Tk()
+    root.withdraw()
+    _ui_root = root
+    system_overlay.set_ui_root(root)
+    screenshot_mod.set_ui_root(root)
+    root.after(20, _drain_ui_tasks)
+    _ui_ready.set()
+    log.info("Shared Tk UI thread started")
+
+    try:
+        root.mainloop()
+    finally:
+        system_overlay.set_ui_root(None)
+        screenshot_mod.set_ui_root(None)
+        _ui_root = None
+        _ui_ready.clear()
+        log.info("Shared Tk UI thread stopped")
+
+
+def ensure_ui_thread() -> None:
+    global _ui_thread
+
+    if _ui_thread is not None and _ui_thread.is_alive() and _ui_root is not None:
+        return
+
+    _ui_ready.clear()
+    _ui_thread = threading.Thread(target=_run_ui_loop, daemon=True, name="tk-ui-thread")
+    _ui_thread.start()
+    if not _ui_ready.wait(timeout=5):
+        raise RuntimeError("Timed out starting shared Tk UI thread")
+
+
+def _schedule_on_ui_thread(callback) -> None:
+    ensure_ui_thread()
+    if _ui_root is None:
+        raise RuntimeError("Shared Tk UI root is not available")
+
+    if threading.current_thread() is _ui_thread:
+        callback()
+    else:
+        _ui_tasks.put(callback)
+
+
+def _shutdown_ui_thread() -> None:
+    def _close_ui():
+        global _settings_root
+
+        if _settings_root is not None:
+            try:
+                if _settings_root.winfo_exists():
+                    _settings_root.destroy()
+            except Exception:
+                pass
+            _settings_root = None
+
+        system_overlay.close_overlay()
+
+        if _ui_root is not None:
+            try:
+                _ui_root.quit()
+                _ui_root.destroy()
+            except Exception:
+                pass
+
+    if _ui_root is not None:
+        try:
+            _schedule_on_ui_thread(_close_ui)
+        except Exception as e:
+            log.warning(f"Error shutting down shared UI thread: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Shutdown
 # ---------------------------------------------------------------------------
 
 def _shutdown() -> None:
     """Unified cleanup: close overlay, restore GPU, stop hook."""
     log.info("Shutting down...")
-    if _settings_root is not None:
-        try:
-            _settings_root.destroy()
-        except Exception:
-            pass
-    system_overlay.close_overlay()
-    fan_control.stop_fan_control()
-    fan_control.stop_gpu_fan_control()
-    gpu_power.restore_gpu_power_limit()
-    hotkey.stop_keyboard_hook()
+
+    # Stop all components in a safe order with error handling
+    try:
+        _shutdown_ui_thread()
+    except Exception as e:
+        log.error(f"Error shutting down UI thread: {e}")
+    
+    try:
+        fan_control.stop_fan_control()
+    except Exception as e:
+        log.error(f"Error stopping fan control: {e}")
+    
+    try:
+        fan_control.stop_gpu_fan_control()
+    except Exception as e:
+        log.error(f"Error stopping GPU fan control: {e}")
+    
+    try:
+        auto_sleep.stop_auto_sleep()
+    except Exception as e:
+        log.error(f"Error stopping auto sleep: {e}")
+    
+    try:
+        gpu_power.restore_gpu_power_limit()
+    except Exception as e:
+        log.error(f"Error restoring GPU power limit: {e}")
+    
+    # Stop keyboard hook last (this may wait for thread to exit)
+    try:
+        hotkey.stop_keyboard_hook()
+    except Exception as e:
+        log.error(f"Error stopping keyboard hook: {e}")
+    
+    log.info("Shutdown complete")
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +300,7 @@ def create_hidden_window() -> int:
 # Settings dialog
 # ---------------------------------------------------------------------------
 
-def _force_window_focus(root: tk.Tk) -> None:
+def _force_window_focus(root: tk.Misc) -> None:
     """Reliably bring a tkinter window to the foreground on Windows."""
     root.lift()
     root.focus_force()
@@ -194,25 +313,20 @@ def _force_window_focus(root: tk.Tk) -> None:
 
 
 def show_settings_dialog() -> None:
-    # If already open, just bring it to front and return immediately so the
-    # pystray callback thread is never blocked.
-    if _settings_root is not None:
-        try:
-            # Schedule via tkinter's own thread to stay thread-safe.
-            _settings_root.after(0, lambda: _force_window_focus(_settings_root))
-        except Exception:
-            pass
-        return
-
-    # Run the dialog in a dedicated daemon thread so the pystray message pump
-    # is never blocked (a blocked pump means the window gets no Win32 messages
-    # and is completely unresponsive).
     def _run():
         global _settings_root
 
+        if _settings_root is not None:
+            try:
+                if _settings_root.winfo_exists():
+                    _force_window_focus(_settings_root)
+                    return
+            except Exception:
+                _settings_root = None
+
         _initing = [True]   # guard: suppress side-effect callbacks during widget setup
 
-        root = tk.Tk()
+        root = tk.Toplevel(_ui_root)
         _settings_root = root
         root.title("Settings - Little Helper")
         root.resizable(True, True)
@@ -312,7 +426,7 @@ def show_settings_dialog() -> None:
 
         row2 = tk.Frame(gpu_frame)
         row2.pack(fill="x", pady=3)
-        gpu_cb = tk.Checkbutton(row2, text="Enable on startup", variable=gpu_enabled)
+        gpu_cb = tk.Checkbutton(row2, text="Enable", variable=gpu_enabled)
         gpu_cb.pack(side="left")
 
         row3 = tk.Frame(gpu_frame)
@@ -321,13 +435,16 @@ def show_settings_dialog() -> None:
         gpu_spin = tk.Spinbox(row3, from_=w_min, to=w_max, increment=5,
                               textvariable=gpu_watts, width=6)
         gpu_spin.pack(side="left", padx=4)
-        tk.Label(row3, text=f"(GPU range: {w_min}–{w_max} W)",
-                 font=("Arial", 8), fg="gray").pack(side="left")
+        gpu_watts_label = tk.Label(row3, text=f"(GPU range: {w_min}–{w_max} W)",
+                 font=("Arial", 8), fg="gray")
+        gpu_watts_label.pack(side="left")
 
-        def _toggle_spin(*_):
-            gpu_spin.configure(state="normal" if gpu_enabled.get() else "disabled")
-        gpu_enabled.trace_add("write", _toggle_spin)
-        _toggle_spin()
+        def _toggle_gpu_power(*_):
+            state = "normal" if gpu_enabled.get() else "disabled"
+            gpu_spin.configure(state=state)
+            gpu_watts_label.configure(fg="#808080" if state == "disabled" else "gray")
+        gpu_enabled.trace_add("write", _toggle_gpu_power)
+        _toggle_gpu_power()
 
         def _apply_gpu_power(*_):
             if _initing[0]: return
@@ -348,20 +465,30 @@ def show_settings_dialog() -> None:
 
         row4 = tk.Frame(ov_frame)
         row4.pack(fill="x", pady=3)
-        tk.Checkbutton(row4, text="Show overlay on startup",
-                       variable=ov_enabled).pack(side="left")
+        ov_cb = tk.Checkbutton(row4, text="Enable",
+                       variable=ov_enabled)
+        ov_cb.pack(side="left")
 
         row5 = tk.Frame(ov_frame)
         row5.pack(fill="x", pady=3)
         tk.Label(row5, text="Opacity:", width=14, anchor="w").pack(side="left")
-        tk.Spinbox(row5, from_=0.20, to=1.00, increment=0.05, format="%.2f",
-                   textvariable=ov_opacity, width=6).pack(side="left", padx=4)
+        ov_opacity_spin = tk.Spinbox(row5, from_=0.20, to=1.00, increment=0.05, format="%.2f",
+                   textvariable=ov_opacity, width=6)
+        ov_opacity_spin.pack(side="left", padx=4)
 
         row6 = tk.Frame(ov_frame)
         row6.pack(fill="x", pady=3)
         tk.Label(row6, text="Refresh (ms):", width=14, anchor="w").pack(side="left")
-        tk.Spinbox(row6, from_=100, to=5000, increment=100,
-                   textvariable=ov_refresh, width=6).pack(side="left", padx=4)
+        ov_refresh_spin = tk.Spinbox(row6, from_=100, to=5000, increment=100,
+                   textvariable=ov_refresh, width=6)
+        ov_refresh_spin.pack(side="left", padx=4)
+
+        def _toggle_overlay(*_):
+            state = "normal" if ov_enabled.get() else "disabled"
+            ov_opacity_spin.configure(state=state)
+            ov_refresh_spin.configure(state=state)
+        ov_enabled.trace_add("write", _toggle_overlay)
+        _toggle_overlay()
 
         def _apply_overlay(*_):
             if _initing[0]: return
@@ -386,20 +513,21 @@ def show_settings_dialog() -> None:
 
         row_fc0 = tk.Frame(fc_frame)
         row_fc0.pack(fill="x", pady=3)
-        tk.Checkbutton(row_fc0, text="Enable on startup", variable=fc_enabled).pack(side="left")
+        fc_cb = tk.Checkbutton(row_fc0, text="Enable", variable=fc_enabled)
+        fc_cb.pack(side="left")
 
         row_fc1 = tk.Frame(fc_frame)
         row_fc1.pack(fill="x", pady=3)
         tk.Label(row_fc1, text="Source:", width=14, anchor="w").pack(side="left")
-        tk.OptionMenu(row_fc1, fc_source, "cpu_temp", "gpu_temp", "mixed", "manual").pack(
-            side="left", padx=4
-        )
+        fc_source_menu = tk.OptionMenu(row_fc1, fc_source, "cpu_temp", "gpu_temp", "mixed", "manual")
+        fc_source_menu.pack(side="left", padx=4)
 
         row_fc2 = tk.Frame(fc_frame)
         row_fc2.pack(fill="x", pady=3)
         tk.Label(row_fc2, text="Interval (s):", width=14, anchor="w").pack(side="left")
-        tk.Spinbox(row_fc2, from_=1, to=60, increment=1,
-                   textvariable=fc_interval, width=5).pack(side="left", padx=4)
+        fc_interval_spin = tk.Spinbox(row_fc2, from_=1, to=60, increment=1,
+                   textvariable=fc_interval, width=5)
+        fc_interval_spin.pack(side="left", padx=4)
 
         # Manual fan speed slider (only visible when source == "manual")
         row_fc3 = tk.Frame(fc_frame)
@@ -482,6 +610,7 @@ def show_settings_dialog() -> None:
                  font=("Arial", 8, "bold")).pack(side="left")
 
         _fc_curve_vars = []
+        _fc_curve_entries = []
         for _ct, _cp in _config.get("fan_control", {}).get("curve", []):
             _ctv = tk.StringVar(master=root, value=str(_ct))
             _cpv = tk.StringVar(master=root, value=str(_cp))
@@ -489,8 +618,9 @@ def show_settings_dialog() -> None:
             _cr = tk.Frame(fc_frame)
             _cr.pack(fill="x", pady=1)
             tk.Label(_cr, width=14, anchor="w").pack(side="left")
-            tk.Entry(_cr, textvariable=_ctv, width=7).pack(side="left", padx=2)
-            tk.Entry(_cr, textvariable=_cpv, width=7).pack(side="left", padx=2)
+            _e1 = tk.Entry(_cr, textvariable=_ctv, width=7); _e1.pack(side="left", padx=2)
+            _e2 = tk.Entry(_cr, textvariable=_cpv, width=7); _e2.pack(side="left", padx=2)
+            _fc_curve_entries.extend([_e1, _e2])
 
         def _apply_fc_curve():
             try:
@@ -510,8 +640,21 @@ def show_settings_dialog() -> None:
             except (ValueError, TypeError) as e:
                 log.debug(f"Invalid CPU fan curve: {e}")
 
-        tk.Button(fc_frame, text="Apply Curve",
-                  command=_apply_fc_curve).pack(anchor="w", pady=(2, 6))
+        fc_apply_curve_btn = tk.Button(fc_frame, text="Apply Curve",
+                  command=_apply_fc_curve)
+        fc_apply_curve_btn.pack(anchor="w", pady=(2, 6))
+
+        def _toggle_fc_enabled(*_):
+            state = "normal" if fc_enabled.get() else "disabled"
+            fc_source_menu.configure(state=state)
+            fc_interval_spin.configure(state=state)
+            manual_slider.configure(state=state)
+            fc_apply_curve_btn.configure(state=state)
+            for _e in _fc_curve_entries:
+                _e.configure(state=state)
+
+        fc_enabled.trace_add("write", _toggle_fc_enabled)
+        _toggle_fc_enabled()
 
         # ── Section 5: GPU Fan Control ────────────────────────────────────────
         gfc_frame = _section(outer, "GPU Fan Control  (Nvidia only)")
@@ -524,18 +667,21 @@ def show_settings_dialog() -> None:
 
         row_gfc0 = tk.Frame(gfc_frame)
         row_gfc0.pack(fill="x", pady=3)
-        tk.Checkbutton(row_gfc0, text="Enable on startup", variable=gfc_enabled).pack(side="left")
+        gfc_cb = tk.Checkbutton(row_gfc0, text="Enable", variable=gfc_enabled)
+        gfc_cb.pack(side="left")
 
         row_gfc1 = tk.Frame(gfc_frame)
         row_gfc1.pack(fill="x", pady=3)
         tk.Label(row_gfc1, text="Source:", width=14, anchor="w").pack(side="left")
-        tk.OptionMenu(row_gfc1, gfc_source, "gpu_temp", "manual").pack(side="left", padx=4)
+        gfc_source_menu = tk.OptionMenu(row_gfc1, gfc_source, "gpu_temp", "manual")
+        gfc_source_menu.pack(side="left", padx=4)
 
         row_gfc2 = tk.Frame(gfc_frame)
         row_gfc2.pack(fill="x", pady=3)
         tk.Label(row_gfc2, text="Interval (s):", width=14, anchor="w").pack(side="left")
-        tk.Spinbox(row_gfc2, from_=1, to=60, increment=1,
-                   textvariable=gfc_interval, width=5).pack(side="left", padx=4)
+        gfc_interval_spin = tk.Spinbox(row_gfc2, from_=1, to=60, increment=1,
+                   textvariable=gfc_interval, width=5)
+        gfc_interval_spin.pack(side="left", padx=4)
 
         # Manual slider (only visible when source == "manual")
         row_gfc3 = tk.Frame(gfc_frame)
@@ -610,6 +756,7 @@ def show_settings_dialog() -> None:
                  font=("Arial", 8, "bold")).pack(side="left")
 
         _gfc_curve_vars = []
+        _gfc_curve_entries = []
         for _gt, _gp in _config.get("gpu_fan_control", {}).get("curve", []):
             _gtv = tk.StringVar(master=root, value=str(_gt))
             _gpv = tk.StringVar(master=root, value=str(_gp))
@@ -617,8 +764,9 @@ def show_settings_dialog() -> None:
             _grr = tk.Frame(gfc_frame)
             _grr.pack(fill="x", pady=1)
             tk.Label(_grr, width=14, anchor="w").pack(side="left")
-            tk.Entry(_grr, textvariable=_gtv, width=7).pack(side="left", padx=2)
-            tk.Entry(_grr, textvariable=_gpv, width=7).pack(side="left", padx=2)
+            _ge1 = tk.Entry(_grr, textvariable=_gtv, width=7); _ge1.pack(side="left", padx=2)
+            _ge2 = tk.Entry(_grr, textvariable=_gpv, width=7); _ge2.pack(side="left", padx=2)
+            _gfc_curve_entries.extend([_ge1, _ge2])
 
         def _apply_gfc_curve():
             try:
@@ -636,8 +784,121 @@ def show_settings_dialog() -> None:
             except (ValueError, TypeError) as e:
                 log.debug(f"Invalid GPU fan curve: {e}")
 
-        tk.Button(gfc_frame, text="Apply Curve",
-                  command=_apply_gfc_curve).pack(anchor="w", pady=(2, 6))
+        gfc_apply_curve_btn = tk.Button(gfc_frame, text="Apply Curve",
+                  command=_apply_gfc_curve)
+        gfc_apply_curve_btn.pack(anchor="w", pady=(2, 6))
+
+        def _toggle_gfc_enabled(*_):
+            state = "normal" if gfc_enabled.get() else "disabled"
+            gfc_source_menu.configure(state=state)
+            gfc_interval_spin.configure(state=state)
+            gfc_manual_slider.configure(state=state)
+            gfc_apply_curve_btn.configure(state=state)
+            for _e in _gfc_curve_entries:
+                _e.configure(state=state)
+
+        gfc_enabled.trace_add("write", _toggle_gfc_enabled)
+        _toggle_gfc_enabled()
+
+        # ── Section 6: Auto Sleep ──────────────────────────────────────────────
+        as_frame = _section(outer, "Auto Sleep")
+
+        as_cfg           = _config.get("auto_sleep", {})
+        as_enabled       = tk.BooleanVar(master=root, value=as_cfg.get("enabled", False))
+        as_idle_seconds  = tk.IntVar(master=root, value=as_cfg.get("idle_seconds", 60))
+        as_cpu_threshold = tk.IntVar(master=root, value=as_cfg.get("cpu_threshold", 5))
+        as_gpu_threshold = tk.IntVar(master=root, value=as_cfg.get("gpu_threshold", 5))
+        as_disk_threshold= tk.DoubleVar(master=root, value=as_cfg.get("disk_threshold_mbps", 1.0))
+        as_countdown     = tk.IntVar(master=root, value=as_cfg.get("countdown_seconds", 10))
+
+        row_as0 = tk.Frame(as_frame)
+        row_as0.pack(fill="x", pady=3)
+        as_cb = tk.Checkbutton(row_as0, text="Enable", variable=as_enabled)
+        as_cb.pack(side="left")
+
+        row_as1 = tk.Frame(as_frame)
+        row_as1.pack(fill="x", pady=3)
+        tk.Label(row_as1, text="Idle time (s):", width=16, anchor="w").pack(side="left")
+        as_idle_spin = tk.Spinbox(row_as1, from_=1, to=3600, increment=1,
+                   textvariable=as_idle_seconds, width=5)
+        as_idle_spin.pack(side="left", padx=4)
+
+        row_as2 = tk.Frame(as_frame)
+        row_as2.pack(fill="x", pady=3)
+        tk.Label(row_as2, text="CPU threshold (%):", width=16, anchor="w").pack(side="left")
+        as_cpu_spin = tk.Spinbox(row_as2, from_=1, to=100, increment=1,
+                   textvariable=as_cpu_threshold, width=5)
+        as_cpu_spin.pack(side="left", padx=4)
+
+        row_as3 = tk.Frame(as_frame)
+        row_as3.pack(fill="x", pady=3)
+        tk.Label(row_as3, text="GPU threshold (%):", width=16, anchor="w").pack(side="left")
+        as_gpu_spin = tk.Spinbox(row_as3, from_=1, to=100, increment=1,
+                   textvariable=as_gpu_threshold, width=5)
+        as_gpu_spin.pack(side="left", padx=4)
+
+        row_as4 = tk.Frame(as_frame)
+        row_as4.pack(fill="x", pady=3)
+        tk.Label(row_as4, text="Disk threshold (MB/s):", width=16, anchor="w").pack(side="left")
+        as_disk_spin = tk.Spinbox(row_as4, from_=0.1, to=100, increment=0.1,
+                   textvariable=as_disk_threshold, width=5)
+        as_disk_spin.pack(side="left", padx=4)
+
+        row_as5 = tk.Frame(as_frame)
+        row_as5.pack(fill="x", pady=3)
+        tk.Label(row_as5, text="Countdown (s):", width=16, anchor="w").pack(side="left")
+        as_countdown_spin = tk.Spinbox(row_as5, from_=5, to=60, increment=1,
+                   textvariable=as_countdown, width=5)
+        as_countdown_spin.pack(side="left", padx=4)
+
+        def _apply_as_enabled(*_):
+            if _initing[0]: return
+            _config["auto_sleep"]["enabled"] = as_enabled.get()
+            cfg.save_config(_config)
+            if as_enabled.get():
+                if not auto_sleep.is_auto_sleep_active():
+                    auto_sleep.start_auto_sleep(_config)
+            else:
+                auto_sleep.stop_auto_sleep()
+
+        as_enabled.trace_add("write", _apply_as_enabled)
+
+        def _apply_as_settings(*_):
+            """Apply Auto Sleep settings changes and restart monitoring."""
+            if _initing[0]: return
+            _config["auto_sleep"]["idle_seconds"] = as_idle_seconds.get()
+            _config["auto_sleep"]["cpu_threshold"] = as_cpu_threshold.get()
+            _config["auto_sleep"]["gpu_threshold"] = as_gpu_threshold.get()
+            _config["auto_sleep"]["disk_threshold_mbps"] = as_disk_threshold.get()
+            _config["auto_sleep"]["countdown_seconds"] = as_countdown.get()
+            cfg.save_config(_config)
+            if auto_sleep.is_auto_sleep_active():
+                auto_sleep.stop_auto_sleep()
+                auto_sleep.start_auto_sleep(_config)
+            _notify("Auto Sleep settings applied")
+
+        # Auto Sleep buttons row
+        row_as_buttons = tk.Frame(as_frame)
+        row_as_buttons.pack(fill="x", pady=(8, 0))
+
+        as_apply_btn = tk.Button(
+            row_as_buttons,
+            text="Apply Changes",
+            command=_apply_as_settings,
+        )
+        as_apply_btn.pack(side="left", padx=2)
+
+        def _toggle_as_enabled(*_):
+            state = "normal" if as_enabled.get() else "disabled"
+            as_idle_spin.configure(state=state)
+            as_cpu_spin.configure(state=state)
+            as_gpu_spin.configure(state=state)
+            as_disk_spin.configure(state=state)
+            as_countdown_spin.configure(state=state)
+            as_apply_btn.configure(state=state)
+
+        as_enabled.trace_add("write", _toggle_as_enabled)
+        _toggle_as_enabled()
 
         # ── Close: save key fields and slider defaults ────────────────────────
         def _close():
@@ -671,9 +932,7 @@ def show_settings_dialog() -> None:
         # All widgets built — allow trace callbacks to fire from now on
         _initing[0] = False
 
-        root.mainloop()
-
-    threading.Thread(target=_run, daemon=True).start()
+    _schedule_on_ui_thread(_run)
 
 
 # ---------------------------------------------------------------------------
@@ -696,12 +955,7 @@ def create_tray_icon() -> None:
         show_settings_dialog()
 
     def _on_toggle_overlay(icon, item):
-        threading.Thread(
-            target=system_overlay.toggle_overlay,
-            args=(_config, cfg.save_config),
-            kwargs={"on_close_fn": icon.update_menu},
-            daemon=True,
-        ).start()
+        system_overlay.toggle_overlay(_config, cfg.save_config, on_close_fn=icon.update_menu)
 
     def _on_toggle_fan_control(icon, item):
         if fan_control.fan_control_is_active():
@@ -774,30 +1028,60 @@ def create_tray_icon() -> None:
     def on_setup(icon):
         icon.visible = True
         # Apply GPU power limit after tray is visible (so notify works)
-        gpu_power.apply_gpu_power_limit(_config, notify_fn=_notify)
+        try:
+            gpu_power.apply_gpu_power_limit(_config, notify_fn=_notify)
+        except Exception as e:
+            log.error(f"Error applying GPU power limit: {e}", exc_info=True)
+        
         # Sync manual_pct from config into the module
-        fan_control.set_manual_pct(_config.get("fan_control", {}).get("manual_pct", 50))
-        fan_control.set_gpu_manual_pct(_config.get("gpu_fan_control", {}).get("manual_pct", 50))
+        try:
+            fan_control.set_manual_pct(_config.get("fan_control", {}).get("manual_pct", 50))
+            fan_control.set_gpu_manual_pct(_config.get("gpu_fan_control", {}).get("manual_pct", 50))
+        except Exception as e:
+            log.error(f"Error setting manual fan percentages: {e}", exc_info=True)
+        
+        # Register auto_sleep keyboard activity callback
+        try:
+            hotkey.register_activity_callback(auto_sleep.notify_keyboard_activity)
+        except Exception as e:
+            log.error(f"Error registering activity callback: {e}", exc_info=True)
+        
+        # Auto-start auto_sleep if configured
+        try:
+            auto_sleep.start_auto_sleep(_config)
+        except Exception as e:
+            log.error(f"Error starting auto_sleep: {e}", exc_info=True)
+        
         # Auto-start CPU fan control if configured
-        if _config.get("fan_control", {}).get("enabled", False):
-            lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
-            if lhm_computer is not None:
-                fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
-            else:
-                log.warning("CPU fan control enabled in config but LHM is not available")
+        try:
+            if _config.get("fan_control", {}).get("enabled", False):
+                lhm_computer, lhm_lock = system_overlay.get_lhm_computer()
+                if lhm_computer is not None:
+                    fan_control.start_fan_control(_config, lhm_computer, lhm_lock)
+                else:
+                    log.warning("CPU fan control enabled in config but LHM is not available")
+        except Exception as e:
+            log.error(f"Error starting CPU fan control: {e}", exc_info=True)
+        
         # Auto-start GPU fan control if configured
-        if _config.get("gpu_fan_control", {}).get("enabled", False):
-            fan_control.start_gpu_fan_control(_config)
+        try:
+            if _config.get("gpu_fan_control", {}).get("enabled", False):
+                fan_control.start_gpu_fan_control(_config)
+        except Exception as e:
+            log.error(f"Error starting GPU fan control: {e}", exc_info=True)
+        
         # Auto-open overlay if configured
-        if _config.get("overlay", {}).get("enabled", False):
-            threading.Thread(
-                target=system_overlay.toggle_overlay,
-                args=(_config, cfg.save_config),
-                kwargs={"on_close_fn": icon.update_menu},
-                daemon=True,
-            ).start()
+        try:
+            if _config.get("overlay", {}).get("enabled", False):
+                system_overlay.toggle_overlay(_config, cfg.save_config, on_close_fn=icon.update_menu)
+        except Exception as e:
+            log.error(f"Error starting overlay: {e}", exc_info=True)
+        
         # Refresh tray menu checkmarks after all state has been set
-        icon.update_menu()
+        try:
+            icon.update_menu()
+        except Exception as e:
+            log.error(f"Error updating tray menu: {e}", exc_info=True)
 
     log.info("Starting tray icon...")
     icon.run(setup=on_setup)
@@ -830,6 +1114,10 @@ if __name__ == "__main__":
 
     system_overlay.init_nvml()
     system_overlay.init_lhm()
+    ensure_ui_thread()
+    
+    # Set up auto_sleep UI callback
+    auto_sleep.set_ui_callback(_schedule_on_ui_thread)
 
     try:
         _hidden_hwnd = create_hidden_window()

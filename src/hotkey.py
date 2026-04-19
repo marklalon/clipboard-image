@@ -92,6 +92,10 @@ VK_CODES = {
 # Module-level state
 _hook_handle = None
 _hook_proc   = None  # kept alive to prevent GC
+_hook_thread = None  # reference to the hook thread for clean shutdown
+_stop_event  = threading.Event()  # signal to stop the message loop
+
+_activity_callbacks = []  # callbacks for user activity (called on any keydown)
 
 import time as _time
 _last_paste_t      = 0.0
@@ -103,18 +107,36 @@ def _is_key_down(vk_code: int) -> bool:
     return bool(_user32.GetAsyncKeyState(vk_code) & 0x8000)
 
 
+def register_activity_callback(fn) -> None:
+    """Register a callback to be called on any keyboard activity (WM_KEYDOWN)."""
+    if fn not in _activity_callbacks:
+        _activity_callbacks.append(fn)
+
+
 def start_keyboard_hook(config: dict, on_paste_fn, on_screenshot_fn) -> None:
     """
     Install WH_KEYBOARD_LL hook and run the message loop (blocks until stopped).
     config, on_paste_fn, on_screenshot_fn are captured via closure.
+    Should be called from a daemon thread to allow clean shutdown.
     """
-    global _hook_handle, _hook_proc
+    global _hook_handle, _hook_proc, _hook_thread, _stop_event
+
+    _hook_thread = threading.current_thread()
+    _stop_event.clear()
 
     def _proc(nCode, wParam, lParam):
         try:
             if nCode == HC_ACTION:
                 kb  = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 vk  = kb.vkCode
+
+                # Call activity callbacks on any WM_KEYDOWN
+                if wParam == WM_KEYDOWN:
+                    for callback in _activity_callbacks:
+                        try:
+                            callback()
+                        except Exception as e:
+                            log.error(f"Error in activity callback: {e}", exc_info=True)
 
                 ctrl_down = _is_key_down(0x11)   # VK_CONTROL
                 alt_down  = _is_key_down(0x12)   # VK_MENU
@@ -179,18 +201,47 @@ def start_keyboard_hook(config: dict, on_paste_fn, on_screenshot_fn) -> None:
 
         msg = ctypes.wintypes.MSG()
         while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            # Check stop event to exit early (e.g., if UnhookWindowsHookEx was called)
+            if _stop_event.is_set():
+                log.debug("Stop event detected in message loop")
+                break
             _user32.TranslateMessage(ctypes.byref(msg))
             _user32.DispatchMessageW(ctypes.byref(msg))
 
         log.info("Keyboard hook message loop ended")
     except Exception as e:
         log.error(f"Exception in start_keyboard_hook: {e}", exc_info=True)
+    finally:
+        # Ensure hook is unhooked
+        if _hook_handle:
+            try:
+                _user32.UnhookWindowsHookEx(_hook_handle)
+            except Exception as e:
+                log.error(f"Error unhoking in finally: {e}")
+        _hook_handle = None
+        _hook_proc = None
+        _hook_thread = None
 
 
 def stop_keyboard_hook() -> None:
-    """Remove the keyboard hook."""
-    global _hook_handle
+    """Remove the keyboard hook and stop the message loop."""
+    global _hook_handle, _stop_event, _hook_thread
+    
+    # Signal the loop to exit
+    _stop_event.set()
+    
     if _hook_handle:
-        _user32.UnhookWindowsHookEx(_hook_handle)
+        log.info("Removing keyboard hook...")
+        try:
+            _user32.UnhookWindowsHookEx(_hook_handle)
+        except Exception as e:
+            log.error(f"Error unhoking: {e}")
         _hook_handle = None
-        log.info("Keyboard hook removed")
+    
+    # Wait for the hook thread to finish (max 2 seconds)
+    if _hook_thread is not None and _hook_thread.is_alive():
+        _hook_thread.join(timeout=2)
+        if _hook_thread.is_alive():
+            log.warning("Hook thread did not stop within timeout")
+    
+    log.info("Keyboard hook stopped")

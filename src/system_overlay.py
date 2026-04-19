@@ -26,6 +26,9 @@ _lhm_cpu_temp  = None   # ISensor reference
 _lhm_cpu_power = None   # ISensor reference
 _lhm_ram_temps = []     # list of ISensor references (one per DIMM)
 _lhm_lock      = threading.Lock()  # serialises all LHM .NET object access
+_ui_root       = None
+_ui_thread_id  = None
+_ui_tasks: queue.Queue = queue.Queue()
 
 
 def init_nvml() -> bool:
@@ -129,6 +132,37 @@ def init_lhm() -> bool:
 def get_lhm_computer():
     """Return (computer, lock) for fan_control to share the LHM instance."""
     return _lhm_computer, _lhm_lock
+
+
+def set_ui_root(root) -> None:
+    """Register the shared Tk UI root used by overlay windows."""
+    global _ui_root, _ui_thread_id
+
+    def _drain_ui_tasks() -> None:
+        try:
+            while True:
+                callback = _ui_tasks.get_nowait()
+                callback()
+        except queue.Empty:
+            pass
+
+        if _ui_root is not None:
+            _ui_root.after(20, _drain_ui_tasks)
+
+    _ui_root = root
+    _ui_thread_id = None if root is None else threading.get_ident()
+    if root is not None:
+        root.after(20, _drain_ui_tasks)
+
+
+def _run_on_ui_thread(callback) -> None:
+    if _ui_root is None:
+        raise RuntimeError("Shared Tk UI root is not available")
+
+    if threading.get_ident() == _ui_thread_id:
+        callback()
+    else:
+        _ui_tasks.put(callback)
 
 
 def lhm_is_available() -> bool:
@@ -269,7 +303,7 @@ def _fmt(val, fmt, unit="", na="N/A"):
 class SystemMonitorOverlay:
     """
     Semi-transparent always-on-top overlay.
-    Runs inside its own tk.Tk() mainloop on a dedicated daemon thread.
+    Lives on the shared Tk UI thread as a Toplevel window.
     """
 
     def __init__(self, config: dict, save_config_fn, on_close_fn=None):
@@ -283,6 +317,7 @@ class SystemMonitorOverlay:
         # drag state
         self._drag_offset_x = 0
         self._drag_offset_y = 0
+        self._closed = False
 
         self.root   = None
         self._labels = {}  # key -> tk.Label
@@ -291,16 +326,17 @@ class SystemMonitorOverlay:
     # Public API (called from other threads)
     # -----------------------------------------------------------------------
 
-    def run(self) -> None:
-        """Build UI and run mainloop (blocks until close())."""
+    def show(self, parent) -> None:
+        """Build the overlay window on the shared Tk UI thread."""
         global _overlay_instance
         self._running = True
-        self.root = tk.Tk()
+        self.root = tk.Toplevel(parent)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", self.config["overlay"]["opacity"])
         self.root.configure(bg=_BG)
         self.root.resizable(False, False)
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
 
         self._build_ui()
         self._position_window()
@@ -309,35 +345,44 @@ class SystemMonitorOverlay:
         # Kick off stats loop
         self.root.after(100, self._update_stats)
 
-        try:
-            self.root.mainloop()
-        finally:
-            # mainloop exited (normal close OR unexpected destruction).
-            # Ensure global state and tray menu are always cleaned up.
-            self._running = False
-            if _overlay_instance is self:
-                _overlay_instance = None
-            if self._on_close_fn:
+    def close(self) -> None:
+        """Destroy the window (safe to call from any thread)."""
+        def _close_impl():
+            self._finalize_close()
+            if self.root is not None:
                 try:
-                    self._on_close_fn()
+                    if self.root.winfo_exists():
+                        self.root.destroy()
                 except Exception:
                     pass
 
-    def close(self) -> None:
-        """Destroy the window (safe to call from any thread)."""
-        global _overlay_instance
-        self._running = False
-        if self.root:
+        if self.root is not None:
             try:
-                self.root.after(0, self.root.destroy)
+                _run_on_ui_thread(_close_impl)
             except Exception:
                 pass
-        _overlay_instance = None
+        else:
+            self._finalize_close()
+
+    def _finalize_close(self) -> None:
+        global _overlay_instance
+
+        if self._closed:
+            return
+
+        self._closed = True
+        self._running = False
+        if _overlay_instance is self:
+            _overlay_instance = None
         if self._on_close_fn:
             try:
                 self._on_close_fn()
             except Exception:
                 pass
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self.root:
+            self._finalize_close()
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -556,21 +601,32 @@ _overlay_instance: SystemMonitorOverlay | None = None
 
 def toggle_overlay(config: dict, save_config_fn, on_close_fn=None) -> None:
     """Show or hide the overlay. Safe to call from any thread."""
-    global _overlay_instance
-    if _overlay_instance is not None:
-        _overlay_instance.close()
-        _overlay_instance = None
-    else:
-        _overlay_instance = SystemMonitorOverlay(config, save_config_fn, on_close_fn=on_close_fn)
-        threading.Thread(target=_overlay_instance.run, daemon=True).start()
+    def _toggle_impl():
+        global _overlay_instance
+
+        if _overlay_instance is not None:
+            _overlay_instance.close()
+        else:
+            _overlay_instance = SystemMonitorOverlay(config, save_config_fn, on_close_fn=on_close_fn)
+            _overlay_instance.show(_ui_root)
+
+    try:
+        _run_on_ui_thread(_toggle_impl)
+    except Exception as e:
+        log.error(f"Error toggling overlay: {e}", exc_info=True)
 
 
 def close_overlay() -> None:
     """Close overlay if open (called during shutdown)."""
-    global _overlay_instance
-    if _overlay_instance is not None:
-        _overlay_instance.close()
-        _overlay_instance = None
+    def _close_impl():
+        if _overlay_instance is not None:
+            _overlay_instance.close()
+
+    try:
+        _run_on_ui_thread(_close_impl)
+    except Exception:
+        if _overlay_instance is not None:
+            _overlay_instance.close()
 
 
 def overlay_is_open() -> bool:
@@ -579,10 +635,14 @@ def overlay_is_open() -> bool:
 
 def apply_overlay_opacity(opacity: float) -> None:
     """Apply opacity to the running overlay immediately (no restart needed)."""
-    if _overlay_instance is not None and _overlay_instance.root is not None:
-        try:
-            _overlay_instance.root.after(
-                0, lambda: _overlay_instance.root.attributes("-alpha", opacity)
-            )
-        except Exception:
-            pass
+    def _apply_impl():
+        if _overlay_instance is not None and _overlay_instance.root is not None:
+            try:
+                _overlay_instance.root.attributes("-alpha", opacity)
+            except Exception:
+                pass
+
+    try:
+        _run_on_ui_thread(_apply_impl)
+    except Exception:
+        pass

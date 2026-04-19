@@ -3,12 +3,50 @@ Little Helper - Fullscreen screenshot selector.
 """
 
 import logging
+import queue
+import threading
 import tkinter as tk
 from PIL import Image, ImageGrab, ImageTk
 
 from clipboard_paste import copy_image_to_clipboard
 
 log = logging.getLogger("little_helper.screenshot")
+
+_ui_root = None
+_ui_thread_id = None
+_ui_tasks: queue.Queue = queue.Queue()
+_selector_instance = None
+
+
+def set_ui_root(root) -> None:
+    """Register the shared Tk UI root used by screenshot selection."""
+    global _ui_root, _ui_thread_id
+
+    def _drain_ui_tasks() -> None:
+        try:
+            while True:
+                callback = _ui_tasks.get_nowait()
+                callback()
+        except queue.Empty:
+            pass
+
+        if _ui_root is not None:
+            _ui_root.after(20, _drain_ui_tasks)
+
+    _ui_root = root
+    _ui_thread_id = None if root is None else threading.get_ident()
+    if root is not None:
+        root.after(20, _drain_ui_tasks)
+
+
+def _run_on_ui_thread(callback) -> None:
+    if _ui_root is None:
+        raise RuntimeError("Shared Tk UI root is not available")
+
+    if threading.get_ident() == _ui_thread_id:
+        callback()
+    else:
+        _ui_tasks.put(callback)
 
 
 class ScreenshotSelector:
@@ -28,16 +66,17 @@ class ScreenshotSelector:
         self.pending_start = None
         self.dragging_selection = False
 
-    def run(self):
-        """Run the screenshot selector (blocks until done)."""
+    def show(self, parent):
+        """Show the screenshot selector on the shared Tk UI thread."""
         self.screenshot = ImageGrab.grab()
         screen_width, screen_height = self.screenshot.size
 
-        self.root = tk.Tk()
+        self.root = tk.Toplevel(parent)
         self.root.attributes("-fullscreen", True)
         self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
         self.root.config(bg="black")
+        self.root.bind("<Destroy>", self.on_destroy, add="+")
 
         self.canvas = tk.Canvas(
             self.root,
@@ -67,8 +106,12 @@ class ScreenshotSelector:
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_release)
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.root.bind("<Escape>", self.on_escape)
+        self.root.focus_force()
 
-        self.root.mainloop()
+    def on_destroy(self, event):
+        global _selector_instance
+        if event.widget is self.root and _selector_instance is self:
+            _selector_instance = None
 
     def on_mouse_press(self, event):
         if self.selection_box is not None:
@@ -153,8 +196,27 @@ class ScreenshotSelector:
 def on_screenshot(config: dict, notify_fn=None) -> None:
     """Handle screenshot hotkey: launch screenshot selection mode."""
     log.debug("on_screenshot triggered")
+    def _show_impl():
+        global _selector_instance
+
+        try:
+            if _selector_instance is not None:
+                try:
+                    if _selector_instance.root is not None and _selector_instance.root.winfo_exists():
+                        _selector_instance.root.lift()
+                        _selector_instance.root.focus_force()
+                        return
+                except Exception:
+                    _selector_instance = None
+
+            selector = ScreenshotSelector(notify_fn=notify_fn)
+            _selector_instance = selector
+            selector.show(_ui_root)
+        except Exception as e:
+            log.error(f"Error in on_screenshot: {e}", exc_info=True)
+            _selector_instance = None
+
     try:
-        selector = ScreenshotSelector(notify_fn=notify_fn)
-        selector.run()
+        _run_on_ui_thread(_show_impl)
     except Exception as e:
-        log.error(f"Error in on_screenshot: {e}", exc_info=True)
+        log.error(f"Error scheduling screenshot UI: {e}", exc_info=True)
