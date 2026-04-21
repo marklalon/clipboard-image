@@ -2,16 +2,21 @@
 Little Helper - System monitoring overlay window.
 
 Shows RAM, CPU, GPU stats in a draggable, resizable, semi-transparent overlay.
-Runs in its own daemon thread with a Tkinter mainloop.
 """
 
+import copy
+import json
 import os
+import subprocess
 import sys
 import queue
+import time
 import threading
 import logging
+from collections import Counter, defaultdict
 import tkinter as tk
 from tkinter import font as tkfont
+from datetime import datetime, timezone
 
 log = logging.getLogger("little_helper.system_overlay")
 
@@ -25,10 +30,384 @@ _lhm_computer  = None
 _lhm_cpu_temp  = None   # ISensor reference
 _lhm_cpu_power = None   # ISensor reference
 _lhm_ram_temps = []     # list of ISensor references (one per DIMM)
+_lhm_disk_temps = {}    # dict: {unique_disk_name: ISensor} for disk temperatures
+_lhm_disk_storage = {}  # dict: {unique_disk_name: DiskInfoToolkit.Storage} for fallback
+_lhm_disk_display_name_lookup = {}
 _lhm_lock      = threading.Lock()  # serialises all LHM .NET object access
 _ui_root       = None
 _ui_thread_id  = None
 _ui_tasks: queue.Queue = queue.Queue()
+_snapshot_lock = threading.Lock()
+_snapshot_cache = None
+_snapshot_cache_at = 0.0
+_MIN_SNAPSHOT_CACHE_MS = 500
+_diskinfotoolkit_import_attempted = False
+_diskinfotoolkit_storage_manager = None
+
+
+def _disk_temp_sensor_priority(sensor_name: str) -> tuple[int, int]:
+    name = (sensor_name or "").strip().lower()
+    if name == "temperature":
+        return (0, 0)
+    if name.startswith("temperature #"):
+        try:
+            return (1, int(name.split("#", 1)[1].strip()))
+        except (IndexError, ValueError):
+            return (1, 99)
+    if "warning" in name:
+        return (2, 0)
+    if "critical" in name:
+        return (3, 0)
+    return (4, 0)
+
+
+def _serial_suffix(serial_number) -> str | None:
+    serial = "".join(ch for ch in str(serial_number or "").upper() if ch.isalnum())
+    if not serial:
+        return None
+    return serial[-4:] if len(serial) >= 4 else serial
+
+
+def _normalize_disk_name(name) -> str:
+    text = str(name or "Unknown").strip()
+    return " ".join(text.split()) or "Unknown"
+
+
+def _build_windows_disk_serial_suffix_map(entries) -> dict[str, list[str]]:
+    suffixes: dict[str, list[str]] = defaultdict(list)
+    for entry in sorted(entries or [], key=lambda item: int(item.get("Index", 0))):
+        model = _normalize_disk_name(entry.get("Model"))
+        suffix = _serial_suffix(entry.get("SerialNumber"))
+        if model and suffix:
+            suffixes[model].append(suffix)
+    return dict(suffixes)
+
+
+def _get_windows_disk_inventory_entries() -> list[dict]:
+    if os.name != "nt":
+        return []
+
+    try:
+        import pythoncom
+        import wmi
+
+        pythoncom.CoInitialize()
+        try:
+            return [
+                {
+                    "Index": int(getattr(disk, "Index", 0) or 0),
+                    "Model": getattr(disk, "Model", ""),
+                    "SerialNumber": getattr(disk, "SerialNumber", ""),
+                    "InterfaceType": getattr(disk, "InterfaceType", ""),
+                    "MediaType": getattr(disk, "MediaType", ""),
+                    "PNPDeviceID": getattr(disk, "PNPDeviceID", ""),
+                }
+                for disk in wmi.WMI().Win32_DiskDrive()
+            ]
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception as exc:
+        log.debug("Failed to query disk serial numbers via WMI: %s", exc)
+
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "Get-CimInstance Win32_DiskDrive | "
+        "Select-Object Index, Model, SerialNumber | "
+        "ConvertTo-Json -Compress"
+    )
+
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        raw = completed.stdout.strip()
+        if not raw:
+            return []
+        payload = json.loads(raw)
+        return payload if isinstance(payload, list) else [payload]
+    except Exception as exc:
+        log.debug("Failed to query disk serial numbers via PowerShell: %s", exc)
+        return []
+
+
+def _get_windows_disk_serial_suffix_map() -> dict[str, list[str]]:
+    entries = _get_windows_disk_inventory_entries()
+    if not entries:
+        return {}
+    return _build_windows_disk_serial_suffix_map(entries)
+
+
+def _build_windows_disk_display_name_lookup(entries) -> dict[tuple[str, str | None], str]:
+    ordered_entries = sorted(entries or [], key=lambda item: int(item.get("Index", 0)))
+    display_names = _assign_unique_disk_names(
+        [_normalize_disk_name(entry.get("Model")) for entry in ordered_entries],
+        _build_windows_disk_serial_suffix_map(ordered_entries),
+    )
+    display_lookup = {}
+    for entry, display_name in zip(ordered_entries, display_names):
+        model = _normalize_disk_name(entry.get("Model"))
+        display_lookup[(model, f"index:{int(entry.get('Index', 0))}")] = display_name
+        serial_suffix = _serial_suffix(entry.get("SerialNumber"))
+        if serial_suffix:
+            display_lookup[(model, f"serial:{serial_suffix}")] = display_name
+    return display_lookup
+
+
+def _get_windows_disk_display_name_lookup() -> dict[tuple[str, str | None], str]:
+    entries = _get_windows_disk_inventory_entries()
+    if not entries:
+        return {}
+    return _build_windows_disk_display_name_lookup(entries)
+
+
+def _resolve_disk_display_name(
+    disk_name,
+    serial_number,
+    drive_number=None,
+    display_name_lookup: dict[tuple[str, str | None], str] | None = None,
+) -> str:
+    normalized_name = _normalize_disk_name(disk_name)
+    lookup = display_name_lookup or {}
+    if drive_number is not None:
+        try:
+            drive_key = (normalized_name, f"index:{int(drive_number)}")
+            if drive_key in lookup:
+                return lookup[drive_key]
+        except (TypeError, ValueError):
+            pass
+
+    serial_suffix = _serial_suffix(serial_number)
+    if serial_suffix:
+        serial_key = (normalized_name, f"serial:{serial_suffix}")
+        if serial_key in lookup:
+            return lookup[serial_key]
+
+    return normalized_name
+
+
+def _iter_hardware_tree(root_hardware):
+    stack = [root_hardware]
+    while stack:
+        hardware = stack.pop()
+        yield hardware
+        try:
+            stack.extend(reversed(list(hardware.SubHardware)))
+        except Exception:
+            pass
+
+
+def _iter_storage_hardware(_lhm_computer_instance):
+    if _lhm_computer_instance is None:
+        return
+    for hardware in _lhm_computer_instance.Hardware:
+        for node in _iter_hardware_tree(hardware):
+            try:
+                if node.HardwareType.ToString() == "Storage":
+                    yield node
+            except Exception:
+                continue
+
+
+def _get_storage_object(hardware):
+    storage_prop = hardware.GetType().GetProperty("Storage")
+    return storage_prop.GetValue(hardware) if storage_prop is not None else None
+
+
+def _get_disk_temp_sensor_candidates(hardware):
+    candidates = []
+    for node in _iter_hardware_tree(hardware):
+        try:
+            node.Update()
+        except Exception:
+            pass
+        for sensor in node.Sensors:
+            if sensor.SensorType.ToString() != "Temperature":
+                continue
+            candidates.append(sensor)
+    return candidates
+
+
+def _select_best_disk_temp_sensor(hardware):
+    selected_sensor = None
+    for sensor in _get_disk_temp_sensor_candidates(hardware):
+        if selected_sensor is None or _disk_temp_sensor_priority(sensor.Name) < _disk_temp_sensor_priority(selected_sensor.Name):
+            selected_sensor = sensor
+    return selected_sensor
+
+
+def _refresh_lhm_storage_state() -> None:
+    global _lhm_disk_display_name_lookup
+
+    if _lhm_computer is None:
+        return
+
+    if not _lhm_disk_display_name_lookup:
+        _lhm_disk_display_name_lookup = _get_windows_disk_display_name_lookup()
+
+    for hardware in _iter_storage_hardware(_lhm_computer):
+        try:
+            hardware.Update()
+        except Exception:
+            pass
+
+        try:
+            stor_obj = _get_storage_object(hardware)
+        except Exception as exc:
+            stor_obj = None
+            log.debug("Failed to get Storage object for %s: %s", _normalize_disk_name(hardware.Name), exc)
+
+        disk_name = _resolve_disk_display_name(
+            hardware.Name,
+            getattr(stor_obj, 'SerialNumber', None),
+            getattr(stor_obj, 'DriveNumber', None),
+            _lhm_disk_display_name_lookup,
+        )
+
+        if stor_obj is not None:
+            _lhm_disk_storage[disk_name] = stor_obj
+
+        candidates = _get_disk_temp_sensor_candidates(hardware)
+        selected_sensor = None
+        for sensor in candidates:
+            if selected_sensor is None or _disk_temp_sensor_priority(sensor.Name) < _disk_temp_sensor_priority(selected_sensor.Name):
+                selected_sensor = sensor
+        if selected_sensor is not None:
+            _lhm_disk_temps[disk_name] = selected_sensor
+
+
+def _is_expected_disk_entry(entry: dict) -> bool:
+    model = _normalize_disk_name(entry.get("Model"))
+    interface_type = str(entry.get("InterfaceType") or "").strip().upper()
+    media_type = str(entry.get("MediaType") or "").strip().lower()
+    pnp_device_id = str(entry.get("PNPDeviceID") or "").strip().upper()
+
+    if not model or interface_type == "USB" or pnp_device_id.startswith("USBSTOR\\"):
+        return False
+
+    if media_type and "fixed" not in media_type:
+        return False
+
+    return True
+
+
+def _get_expected_disk_display_names() -> list[str]:
+    entries = [
+        entry for entry in _get_windows_disk_inventory_entries()
+        if _is_expected_disk_entry(entry)
+    ]
+    entries.sort(key=lambda entry: int(entry.get("Index", 0)))
+    return _assign_unique_disk_names(
+        [_normalize_disk_name(entry.get("Model")) for entry in entries],
+        _build_windows_disk_serial_suffix_map(entries),
+    )
+
+
+def _assign_unique_disk_names(disk_names: list[str], serial_suffix_map: dict[str, list[str]] | None = None) -> list[str]:
+    normalized_names = [_normalize_disk_name(name) for name in disk_names]
+    counts = Counter(normalized_names)
+    occurrences: dict[str, int] = defaultdict(int)
+    serial_suffix_map = {
+        _normalize_disk_name(name): list(suffixes)
+        for name, suffixes in (serial_suffix_map or {}).items()
+    }
+    unique_names = []
+
+    for disk_name in normalized_names:
+        known_duplicates = len(serial_suffix_map.get(disk_name, [])) > 1
+        if counts[disk_name] <= 1 and not known_duplicates:
+            unique_names.append(disk_name)
+            continue
+
+        idx = occurrences[disk_name]
+        occurrences[disk_name] += 1
+        suffixes = serial_suffix_map.get(disk_name, [])
+        if idx < len(suffixes):
+            suffix = suffixes[idx]
+        else:
+            suffix = str(idx + 1)
+        unique_names.append(f"{disk_name} ({suffix})")
+
+    return unique_names
+
+
+def _rename_disk_temp_values(disk_values: dict[str, float]) -> dict[str, float]:
+    renamed_values: dict[str, float | None] = {
+        disk_name: None for disk_name in _get_expected_disk_display_names()
+    }
+
+    if not disk_values:
+        return renamed_values
+
+    display_names = _assign_unique_disk_names(
+        list(disk_values.keys()),
+        _get_windows_disk_serial_suffix_map(),
+    )
+    for display_name, value in zip(display_names, disk_values.values()):
+        renamed_values[display_name] = value
+
+    return renamed_values
+
+
+def _get_diskinfotoolkit_storage_manager():
+    global _diskinfotoolkit_import_attempted, _diskinfotoolkit_storage_manager
+
+    if _diskinfotoolkit_import_attempted:
+        return _diskinfotoolkit_storage_manager
+
+    _diskinfotoolkit_import_attempted = True
+
+    try:
+        import clr
+
+        if getattr(sys, 'frozen', False):
+            dll_dir = os.path.join(sys._MEIPASS, "lhm")
+        else:
+            dll_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "lib", "lhm")
+
+        clr.AddReference(os.path.join(dll_dir, "BlackSharp.Core.dll"))
+        clr.AddReference(os.path.join(dll_dir, "DiskInfoToolkit.dll"))
+        from DiskInfoToolkit import StorageManager
+
+        _diskinfotoolkit_storage_manager = StorageManager
+    except Exception as exc:
+        log.debug("DiskInfoToolkit fallback unavailable: %s", exc)
+        _diskinfotoolkit_storage_manager = None
+
+    return _diskinfotoolkit_storage_manager
+
+
+def _get_diskinfotoolkit_temp_values() -> dict[str, float]:
+    storage_manager = _get_diskinfotoolkit_storage_manager()
+    if storage_manager is None:
+        return {}
+
+    display_name_lookup = _lhm_disk_display_name_lookup or _get_windows_disk_display_name_lookup()
+    disk_values = {}
+
+    try:
+        storage_manager.ReloadStorages()
+        for storage in storage_manager.Storages:
+            smart = getattr(storage, 'Smart', None)
+            temp = getattr(smart, 'Temperature', None) if smart is not None else None
+            if temp is None:
+                continue
+            disk_name = _resolve_disk_display_name(
+                getattr(storage, 'Model', None),
+                getattr(storage, 'SerialNumber', None),
+                getattr(storage, 'DriveNumber', None),
+                display_name_lookup,
+            )
+            disk_values[disk_name] = float(temp)
+    except Exception as exc:
+        log.debug("DiskInfoToolkit fallback read failed: %s", exc)
+
+    return disk_values
 
 
 def init_nvml() -> bool:
@@ -56,8 +435,8 @@ def init_nvml() -> bool:
 
 
 def init_lhm() -> bool:
-    """Attempt to initialise LibreHardwareMonitorLib for CPU/RAM sensors. Call once at startup."""
-    global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power, _lhm_ram_temps
+    """Attempt to initialise LibreHardwareMonitorLib for CPU/RAM/Disk sensors. Call once at startup."""
+    global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power, _lhm_ram_temps, _lhm_disk_temps, _lhm_disk_storage, _lhm_disk_display_name_lookup
     try:
         import clr
         # Find the DLL path (works for both source and PyInstaller frozen EXE)
@@ -73,6 +452,13 @@ def init_lhm() -> bool:
         clr.AddReference(os.path.join(dll_dir, "LibreHardwareMonitorLib.dll"))
         from LibreHardwareMonitor.Hardware import Computer
 
+        _lhm_cpu_temp = None
+        _lhm_cpu_power = None
+        _lhm_ram_temps = []
+        _lhm_disk_temps = {}
+        _lhm_disk_storage = {}
+        _lhm_disk_display_name_lookup = {}
+
         _lhm_computer = Computer()
         _lhm_computer.IsCpuEnabled = True
         _lhm_computer.IsGpuEnabled = False
@@ -80,8 +466,9 @@ def init_lhm() -> bool:
         _lhm_computer.IsMotherboardEnabled = True
         _lhm_computer.IsControllerEnabled = True   # needed for SMBus (DIMM temps)
         _lhm_computer.IsNetworkEnabled = False
-        _lhm_computer.IsStorageEnabled = False
+        _lhm_computer.IsStorageEnabled = True    # needed for disk temperatures
         _lhm_computer.Open()
+        _lhm_disk_display_name_lookup = _get_windows_disk_display_name_lookup()
 
         for hardware in _lhm_computer.Hardware:
             hw_type = hardware.HardwareType.ToString()
@@ -100,6 +487,40 @@ def init_lhm() -> bool:
                             _lhm_cpu_power = sensor
                             log.debug(f"Found CPU power sensor: {sensor.Name}")
 
+            elif hw_type == "Storage":
+                try:
+                    stor_obj = _get_storage_object(hardware)
+                    disk_name = _resolve_disk_display_name(
+                        hardware.Name,
+                        getattr(stor_obj, 'SerialNumber', None),
+                        getattr(stor_obj, 'DriveNumber', None),
+                        _lhm_disk_display_name_lookup,
+                    )
+                    if stor_obj is not None:
+                        _lhm_disk_storage[disk_name] = stor_obj
+                        log.debug(
+                            "Storage object for %s: serial=%s, SmartKey=%s, controller=%s",
+                            disk_name,
+                            getattr(stor_obj, 'SerialNumber', '?'),
+                            getattr(stor_obj, 'SmartKey', '?'),
+                            getattr(stor_obj, 'StorageControllerType', '?'),
+                        )
+                    else:
+                        log.debug("Storage property is None for %s", disk_name)
+                except Exception as _e:
+                    disk_name = _normalize_disk_name(hardware.Name)
+                    log.debug("Failed to get Storage object for %s: %s", disk_name, _e)
+                selected_sensor = _select_best_disk_temp_sensor(hardware)
+                if selected_sensor is not None:
+                    _lhm_disk_temps[disk_name] = selected_sensor
+                    log.debug(
+                        "Selected disk temp sensor: %s -> %s",
+                        disk_name,
+                        selected_sensor.Name,
+                    )
+                else:
+                    log.debug("No temperature sensor found for disk: %s", disk_name)
+
             else:
                 # RAM temps may appear under SMBus, EmbeddedController, or other
                 # hardware types — scan all non-CPU hardware for DIMM/DDR temp sensors
@@ -117,10 +538,13 @@ def init_lhm() -> bool:
                             _lhm_ram_temps.append(sensor)
                             log.debug(f"Found RAM temp sensor: {sensor.Name} on {hw_type}")
 
+        _refresh_lhm_storage_state()
+
         _lhm_available = True
         log.info(
             f"LibreHardwareMonitorLib initialised: CPU sensors found, "
-            f"{len(_lhm_ram_temps)} RAM temp sensor(s)"
+            f"{len(_lhm_ram_temps)} RAM temp sensor(s), "
+            f"{len(_lhm_disk_temps)} disk sensor(s)"
         )
         return True
     except Exception as e:
@@ -218,7 +642,9 @@ def get_system_stats() -> dict:
         "ram_used_gb":  None,
         "ram_total_gb": None,
         "ram_pct":      None,
-        "ram_temp_c":   None,
+        "ram_temps":    None,   # list of temperatures for each RAM module
+        "ram_temp_c":   None,   # average RAM temperature
+        "disk_temps":   None,   # dict: {disk_name: temp_c}
         "cpu_pct":      None,
         "cpu_temp_c":   None,
         "cpu_power_w":  None,
@@ -247,6 +673,7 @@ def get_system_stats() -> dict:
                                     sub.Update()
                                 except Exception:
                                     pass
+                    _refresh_lhm_storage_state()
                     cpu_temp  = _lhm_cpu_temp.Value  if _lhm_cpu_temp  is not None else None
                     cpu_power = _lhm_cpu_power.Value if _lhm_cpu_power is not None else None
                     ram_vals  = []
@@ -257,10 +684,41 @@ def get_system_stats() -> dict:
                                 ram_vals.append(float(v))
                         except Exception:
                             pass
+                    disk_vals = {}
+                    for disk_name, sensor in _lhm_disk_temps.items():
+                        try:
+                            v = sensor.Value
+                            if v is not None:
+                                disk_vals[disk_name] = float(v)
+                        except Exception:
+                            pass
+                    # Fallback: for drives with no LHM sensor, try Smart.Temperature directly
+                    for disk_name, stor_obj in _lhm_disk_storage.items():
+                        if disk_name in disk_vals:
+                            continue
+                        try:
+                            smart = stor_obj.Smart
+                            if smart is not None:
+                                temp = smart.Temperature
+                                if temp is not None:
+                                    disk_vals[disk_name] = float(temp)
+                                    log.debug("Got temp for %s via Smart.Temperature fallback: %s", disk_name, temp)
+                        except Exception:
+                            pass
+                    missing_disk_names = [
+                        disk_name for disk_name in _get_expected_disk_display_names()
+                        if disk_name not in disk_vals
+                    ]
+                    if missing_disk_names:
+                        for disk_name, temp in _get_diskinfotoolkit_temp_values().items():
+                            if disk_name in missing_disk_names:
+                                disk_vals[disk_name] = temp
                 result["cpu_temp_c"]  = cpu_temp
                 result["cpu_power_w"] = cpu_power
                 if ram_vals:
+                    result["ram_temps"] = ram_vals
                     result["ram_temp_c"] = sum(ram_vals) / len(ram_vals)
+                result["disk_temps"] = _rename_disk_temp_values(disk_vals)
             except Exception as e:
                 log.debug(f"LHM sensor read error: {e}")
 
@@ -268,6 +726,114 @@ def get_system_stats() -> dict:
         log.error(f"get_system_stats error: {e}", exc_info=True)
 
     return result
+
+
+def get_monitor_stats() -> dict:
+    return {**get_system_stats(), **get_gpu_stats()}
+
+
+def _temp_level(temp_c):
+    if temp_c is None:
+        return "na"
+    if temp_c >= 80:
+        return "hot"
+    if temp_c >= 70:
+        return "warm"
+    return "normal"
+
+
+def _level_to_color(level: str) -> str:
+    if level == "hot":
+        return _FG_HOT
+    if level == "warm":
+        return _FG_WARM
+    if level == "na":
+        return _FG_NA
+    return _FG_NORMAL
+
+
+def build_overlay_rows(stats: dict) -> dict:
+    cpu_parts = []
+    if stats.get("cpu_pct") is not None:
+        cpu_parts.append(f"{stats['cpu_pct']:.0f}%")
+    if stats.get("cpu_temp_c") is not None:
+        cpu_parts.append(f"{stats['cpu_temp_c']:.0f}°C")
+    if stats.get("cpu_power_w") is not None:
+        cpu_parts.append(f"{stats['cpu_power_w']:.0f}W")
+
+    ram_text = "N/A"
+    ram_level = "na"
+    if stats.get("ram_used_gb") is not None and stats.get("ram_total_gb") is not None:
+        ram_text = f"{stats['ram_used_gb']:.1f}/{stats['ram_total_gb']:.0f}GB"
+        if stats.get("ram_temp_c") is not None:
+            ram_text += f"  {stats['ram_temp_c']:.0f}°C"
+            ram_level = _temp_level(stats.get("ram_temp_c"))
+        else:
+            ram_level = "normal"
+
+    gpu_parts = []
+    if stats.get("gpu_util_pct") is not None:
+        gpu_parts.append(f"{stats['gpu_util_pct']}%")
+    if stats.get("gpu_temp_c") is not None:
+        gpu_parts.append(f"{stats['gpu_temp_c']:.0f}°C")
+    if stats.get("gpu_power_w") is not None:
+        gpu_parts.append(f"{stats['gpu_power_w']:.0f}W")
+
+    vram_text = "N/A"
+    vram_level = "na"
+    if stats.get("vram_used_mb") is not None and stats.get("vram_total_mb") is not None:
+        vram_text = f"{stats['vram_used_mb'] / 1024:.1f}/{stats['vram_total_mb'] / 1024:.0f}GB"
+        vram_level = "normal"
+
+    cpu_level = _temp_level(stats.get("cpu_temp_c")) if stats.get("cpu_temp_c") is not None else ("normal" if cpu_parts else "na")
+    gpu_level = _temp_level(stats.get("gpu_temp_c")) if stats.get("gpu_temp_c") is not None else ("normal" if gpu_parts else "na")
+
+    return {
+        "cpu": {
+            "text": "  ".join(cpu_parts) if cpu_parts else "N/A",
+            "level": cpu_level,
+        },
+        "ram": {
+            "text": ram_text,
+            "level": ram_level,
+        },
+        "gpu": {
+            "text": "  ".join(gpu_parts) if gpu_parts else "N/A",
+            "level": gpu_level,
+        },
+        "vram": {
+            "text": vram_text,
+            "level": vram_level,
+        },
+    }
+
+
+def get_monitor_snapshot(max_age_ms: int = 500) -> dict:
+    global _snapshot_cache, _snapshot_cache_at
+
+    max_age_s = max(_MIN_SNAPSHOT_CACHE_MS, int(max_age_ms)) / 1000.0
+    now = time.monotonic()
+
+    with _snapshot_lock:
+        if (
+            _snapshot_cache is not None
+            and max_age_s > 0
+            and (now - _snapshot_cache_at) <= max_age_s
+        ):
+            return copy.deepcopy(_snapshot_cache)
+
+        stats = get_monitor_stats()
+        snapshot = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "sources": {
+                "nvml": _nvml_available,
+                "lhm": _lhm_available,
+            },
+            "stats": stats,
+        }
+        _snapshot_cache = snapshot
+        _snapshot_cache_at = now
+        return copy.deepcopy(snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -285,13 +851,7 @@ _FONT_BOLD = ("Consolas", 9, "bold")
 
 
 def _temp_color(temp_c):
-    if temp_c is None:
-        return _FG_NA
-    if temp_c >= 80:
-        return _FG_HOT
-    if temp_c >= 70:
-        return _FG_WARM
-    return _FG_NORMAL
+    return _level_to_color(_temp_level(temp_c))
 
 
 def _fmt(val, fmt, unit="", na="N/A"):
@@ -495,56 +1055,20 @@ class SystemMonitorOverlay:
 
     def _fetch_thread(self) -> None:
         try:
-            sys_stats = get_system_stats()
-            gpu_stats = get_gpu_stats()
-            combined  = {**sys_stats, **gpu_stats}
+            snapshot = get_monitor_snapshot()
             try:
-                self._q.put_nowait(combined)
+                self._q.put_nowait(snapshot)
             except queue.Full:
                 pass
         finally:
             self._fetch_running = False
 
-    def _apply_stats(self, s: dict) -> None:
-        """Update label text and colours from a stats dict."""
-        # CPU: [usage%] [temp°C] [power implicit via temp color]
-        cpu_parts = []
-        if s.get("cpu_pct") is not None:
-            cpu_parts.append(f"{s['cpu_pct']:.0f}%")
-        if s.get("cpu_temp_c") is not None:
-            cpu_parts.append(f"{s['cpu_temp_c']:.0f}°C")
-        if s.get("cpu_power_w") is not None:
-            cpu_parts.append(f"{s['cpu_power_w']:.0f}W")
-        cpu_color = _temp_color(s["cpu_temp_c"]) if s.get("cpu_temp_c") is not None else _FG_NORMAL
-        self._set(self._labels["cpu"], "  ".join(cpu_parts) if cpu_parts else "N/A", cpu_color)
-
-        # RAM: used/total [temp°C if available]
-        if s.get("ram_used_gb") is not None:
-            ram_text = f"{s['ram_used_gb']:.1f}/{s['ram_total_gb']:.0f}GB"
-            if s.get("ram_temp_c") is not None:
-                ram_text += f"  {s['ram_temp_c']:.0f}°C"
-            ram_color = _temp_color(s.get("ram_temp_c")) if s.get("ram_temp_c") is not None else _FG_NORMAL
-            self._set(self._labels["ram"], ram_text, ram_color)
-        else:
-            self._set(self._labels["ram"], "N/A", _FG_NA)
-
-        # GPU: [usage%] [temp°C] [power W]
-        gpu_parts = []
-        if s.get("gpu_util_pct") is not None:
-            gpu_parts.append(f"{s['gpu_util_pct']}%")
-        if s.get("gpu_temp_c") is not None:
-            gpu_parts.append(f"{s['gpu_temp_c']:.0f}°C")
-        if s.get("gpu_power_w") is not None:
-            gpu_parts.append(f"{s['gpu_power_w']:.0f}W")
-        gpu_color = _temp_color(s["gpu_temp_c"]) if s.get("gpu_temp_c") is not None else _FG_NORMAL
-        self._set(self._labels["gpu"], "  ".join(gpu_parts) if gpu_parts else "N/A", gpu_color)
-
-        # VRAM: used/total
-        if s.get("vram_used_mb") is not None:
-            self._set(self._labels["vram"],
-                      f"{s['vram_used_mb']/1024:.1f}/{s['vram_total_mb']/1024:.0f}GB", _FG_NORMAL)
-        else:
-            self._set(self._labels["vram"], "N/A", _FG_NA)
+    def _apply_stats(self, snapshot: dict) -> None:
+        """Update label text and colours from a monitor snapshot."""
+        rows = snapshot.get("overlay") or build_overlay_rows(snapshot.get("stats", snapshot))
+        for key, label in self._labels.items():
+            row = rows.get(key, {"text": "N/A", "level": "na"})
+            self._set(label, row["text"], _level_to_color(row["level"]))
 
     @staticmethod
     def _set(label: tk.Label, text: str, color: str) -> None:
@@ -646,3 +1170,4 @@ def apply_overlay_opacity(opacity: float) -> None:
         _run_on_ui_thread(_apply_impl)
     except Exception:
         pass
+

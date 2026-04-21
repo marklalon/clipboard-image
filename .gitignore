@@ -10,4 +10,5 @@ build/
 dist/
 installer/
 
+.venv/
 config.json

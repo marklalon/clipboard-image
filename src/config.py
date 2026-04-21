@@ -26,6 +26,12 @@ DEFAULT_CONFIG = {
         "opacity": 0.85,
         "refresh_ms": 1000,
     },
+    "monitor_server": {
+        "enabled": False,
+        "host": "0.0.0.0",
+        "port": 9980,
+        "token": "",
+    },
     "fan_control": {
         "enabled": True,
         "source": "mixed",   # "gpu_temp" | "cpu_temp" | "mixed" | "manual"

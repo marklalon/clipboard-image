@@ -6,3 +6,6 @@ psutil
 nvidia-ml-py
 wmi
 pythonnet
+starlette
+uvicorn
+websockets

@@ -5,6 +5,7 @@ A lightweight Windows system tray tool that automatically saves clipboard images
 ## Features
 
 - **System tray resident** - runs silently in the background with a tray icon
+- **Built-in monitor server** - optionally expose hardware monitor data over HTTP and WebSocket
 - **Auto-detect target folder** - identifies the currently focused Explorer window or Desktop and saves images there
 - **Keyboard hook (no admin required)** - uses low-level Windows keyboard hook to capture Ctrl+V globally
 - **Smart filename generation** - saves as `clipboard-YYYYMMDD-HHMMSS.png` with auto-increment for duplicates
@@ -22,7 +23,7 @@ A lightweight Windows system tray tool that automatically saves clipboard images
 pip install -r requirements.txt
 ```
 
-Dependencies: `pystray`, `Pillow`, `keyboard`, `pywin32`
+Dependencies: `pystray`, `Pillow`, `keyboard`, `pywin32`, `starlette`, `uvicorn`, `websockets`
 
 ## Usage
 
@@ -46,3 +47,12 @@ pythonw clipboard_image.pyw
 ## Logs
 
 Debug logs are written to `clipboard_image.log` in the same directory as the script.
+
+## Monitor Server
+
+Enable **Monitor Server** in Settings to expose the same hardware stats used by the overlay.
+
+- Default bind address: `0.0.0.0:9980`
+- HTTP snapshot endpoint: `/api/monitor`
+- WebSocket endpoint: `/ws/monitor`
+- Optional auth: set a token in Settings, then pass it as `Authorization: Bearer <token>`, `X-Monitor-Token: <token>`, or `?token=<token>`

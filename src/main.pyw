@@ -30,6 +30,7 @@ import screenshot as screenshot_mod
 import hotkey
 import gpu_power
 import system_overlay
+import monitor_server
 import fan_control
 import auto_sleep
 
@@ -64,7 +65,8 @@ log.addHandler(_fh)
 for _mod in ("little_helper.config", "little_helper.clipboard_paste",
              "little_helper.screenshot", "little_helper.hotkey",
              "little_helper.gpu_power", "little_helper.system_overlay",
-             "little_helper.fan_control", "little_helper.auto_sleep"):
+             "little_helper.monitor_server", "little_helper.fan_control",
+             "little_helper.auto_sleep"):
     _ml = logging.getLogger(_mod)
     _ml.setLevel(logging.INFO)
     _ml.propagate = False
@@ -217,6 +219,11 @@ def _shutdown() -> None:
         _shutdown_ui_thread()
     except Exception as e:
         log.error(f"Error shutting down UI thread: {e}")
+
+    try:
+        monitor_server.stop_monitor_server()
+    except Exception as e:
+        log.error(f"Error stopping monitor server: {e}")
     
     try:
         fan_control.stop_fan_control()
@@ -312,6 +319,16 @@ def _force_window_focus(root: tk.Misc) -> None:
         pass
 
 
+def _apply_window_icon(root: tk.Misc) -> None:
+    """Apply the packaged app icon to Tk windows on Windows."""
+    try:
+        icon_path = cfg.get_resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            root.iconbitmap(icon_path)
+    except Exception:
+        pass
+
+
 def show_settings_dialog() -> None:
     def _run():
         global _settings_root
@@ -329,9 +346,10 @@ def show_settings_dialog() -> None:
         root = tk.Toplevel(_ui_root)
         _settings_root = root
         root.title("Settings - Little Helper")
+        _apply_window_icon(root)
         root.resizable(True, True)
 
-        width, height = 445, 860
+        width, height = 460, 940
         root.update_idletasks()
         x = (root.winfo_screenwidth()  // 2) - (width  // 2)
         y = (root.winfo_screenheight() // 2) - (height // 2)
@@ -502,7 +520,134 @@ def show_settings_dialog() -> None:
         ov_opacity.trace_add("write", _apply_overlay)
         ov_refresh.trace_add("write", _apply_overlay)
 
-        # ── Section 4: CPU Fan Control ────────────────────────────────────────
+        # ── Section 4: Monitor Server ─────────────────────────────────────────
+        ms_frame = _section(outer, "Monitor Server")
+
+        ms_cfg = _config.get("monitor_server", {})
+        ms_enabled = tk.BooleanVar(master=root, value=ms_cfg.get("enabled", False))
+        ms_host = tk.StringVar(master=root, value=ms_cfg.get("host", monitor_server.DEFAULT_HOST))
+        ms_port = tk.IntVar(master=root, value=ms_cfg.get("port", monitor_server.DEFAULT_PORT))
+        ms_token = tk.StringVar(master=root, value=ms_cfg.get("token", ""))
+        ms_hint = tk.StringVar(master=root)
+
+        row_ms0 = tk.Frame(ms_frame)
+        row_ms0.pack(fill="x", pady=3)
+        tk.Checkbutton(row_ms0, text="Enable", variable=ms_enabled).pack(side="left")
+
+        row_ms1 = tk.Frame(ms_frame)
+        row_ms1.pack(fill="x", pady=3)
+        tk.Label(row_ms1, text="Bind IP:", width=14, anchor="w").pack(side="left")
+        ms_host_entry = tk.Entry(row_ms1, textvariable=ms_host, width=18)
+        ms_host_entry.pack(side="left", padx=4)
+
+        row_ms2 = tk.Frame(ms_frame)
+        row_ms2.pack(fill="x", pady=3)
+        tk.Label(row_ms2, text="Port:", width=14, anchor="w").pack(side="left")
+        ms_port_spin = tk.Spinbox(row_ms2, from_=1, to=65535, increment=1,
+                                  textvariable=ms_port, width=8)
+        ms_port_spin.pack(side="left", padx=4)
+
+        row_ms3 = tk.Frame(ms_frame)
+        row_ms3.pack(fill="x", pady=3)
+        tk.Label(row_ms3, text="Token:", width=14, anchor="w").pack(side="left")
+        ms_token_entry = tk.Entry(row_ms3, textvariable=ms_token, width=24)
+        ms_token_entry.pack(side="left", padx=4)
+
+        tk.Label(
+            ms_frame,
+            text="Leave token blank to disable authentication.",
+            font=("Arial", 8),
+            fg="gray",
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", pady=(0, 2))
+
+        ms_hint_label = tk.Label(
+            ms_frame,
+            textvariable=ms_hint,
+            font=("Arial", 8),
+            fg="gray",
+            anchor="w",
+            justify="left",
+            wraplength=390,
+        )
+        ms_hint_label.pack(fill="x", pady=(0, 4))
+
+        def _collect_monitor_server_config() -> dict:
+            try:
+                port_value = ms_port.get()
+            except tk.TclError:
+                port_value = monitor_server.DEFAULT_PORT
+            return monitor_server.normalize_monitor_server_config(
+                {
+                    "monitor_server": {
+                        "enabled": ms_enabled.get(),
+                        "host": ms_host.get(),
+                        "port": port_value,
+                        "token": ms_token.get(),
+                    }
+                }
+            )
+
+        def _update_monitor_server_hint(*_):
+            preview_cfg = _collect_monitor_server_config()
+            urls = monitor_server.get_monitor_urls(preview_cfg)
+            auth_mode = "token required" if preview_cfg.get("token") else "no auth"
+            state = "enabled" if preview_cfg.get("enabled") else "disabled"
+            ms_hint.set(
+                f"HTTP: {urls['http']}\nWS: {urls['websocket']}\nState: {state}, {auth_mode}"
+            )
+
+        def _apply_monitor_server_settings(notify_user: bool = True):
+            if _initing[0]:
+                return
+            new_cfg = _collect_monitor_server_config()
+            old_cfg = dict(_config.get("monitor_server", {}))
+            _config["monitor_server"] = new_cfg
+            cfg.save_config(_config)
+
+            try:
+                if new_cfg.get("enabled"):
+                    if monitor_server.monitor_server_is_running() and old_cfg != new_cfg:
+                        monitor_server.restart_monitor_server(_config)
+                    elif not monitor_server.monitor_server_is_running():
+                        monitor_server.start_monitor_server(_config)
+                else:
+                    monitor_server.stop_monitor_server()
+                if notify_user:
+                    urls = monitor_server.get_monitor_urls(new_cfg)
+                    if new_cfg.get("enabled"):
+                        _notify(
+                            f"Monitor server active\nHTTP: {urls['http']}\nWS: {urls['websocket']}",
+                            "Monitor Server",
+                        )
+                    else:
+                        _notify("Monitor server stopped", "Monitor Server")
+            except Exception as e:
+                log.error(f"Error applying monitor server settings: {e}", exc_info=True)
+                if notify_user:
+                    _notify(f"Monitor server error: {e}", "Monitor Server")
+
+        for _var in (ms_enabled, ms_host, ms_port, ms_token):
+            _var.trace_add("write", _update_monitor_server_hint)
+        _update_monitor_server_hint()
+
+        ms_buttons_row = tk.Frame(ms_frame)
+        ms_buttons_row.pack(fill="x", pady=(4, 0))
+
+        ms_apply_btn = tk.Button(
+            ms_buttons_row,
+            text="Apply Changes",
+            command=lambda: _apply_monitor_server_settings(notify_user=True),
+        )
+        ms_apply_btn.pack(side="left", padx=2)
+
+        ms_enabled.trace_add(
+            "write",
+            lambda *_: None if _initing[0] else _apply_monitor_server_settings(notify_user=True),
+        )
+
+        # ── Section 5: CPU Fan Control ────────────────────────────────────────
         fc_frame = _section(outer, "CPU Fan Control")
 
         fc_cfg      = _config.get("fan_control", {})
@@ -656,7 +801,7 @@ def show_settings_dialog() -> None:
         fc_enabled.trace_add("write", _toggle_fc_enabled)
         _toggle_fc_enabled()
 
-        # ── Section 5: GPU Fan Control ────────────────────────────────────────
+        # ── Section 6: GPU Fan Control ────────────────────────────────────────
         gfc_frame = _section(outer, "GPU Fan Control  (Nvidia only)")
 
         gfc_cfg      = _config.get("gpu_fan_control", {})
@@ -800,7 +945,7 @@ def show_settings_dialog() -> None:
         gfc_enabled.trace_add("write", _toggle_gfc_enabled)
         _toggle_gfc_enabled()
 
-        # ── Section 6: Auto Sleep ──────────────────────────────────────────────
+        # ── Section 7: Auto Sleep ──────────────────────────────────────────────
         as_frame = _section(outer, "Auto Sleep")
 
         as_cfg           = _config.get("auto_sleep", {})
@@ -904,6 +1049,13 @@ def show_settings_dialog() -> None:
         def _close():
             global _settings_root
             dirty = False
+
+            new_monitor_cfg = _collect_monitor_server_config()
+            old_monitor_cfg = dict(_config.get("monitor_server", {}))
+            if old_monitor_cfg != new_monitor_cfg:
+                _config["monitor_server"] = new_monitor_cfg
+                dirty = True
+
             for path, new_val in [
                 (("paste_hotkey",      "key"),        paste_key.get().upper()),
                 (("screenshot_hotkey", "key"),        ss_key.get().upper()),
@@ -916,6 +1068,14 @@ def show_settings_dialog() -> None:
                     dirty = True
             if dirty:
                 cfg.save_config(_config)
+            if old_monitor_cfg != new_monitor_cfg:
+                try:
+                    if new_monitor_cfg.get("enabled"):
+                        monitor_server.restart_monitor_server(_config)
+                    else:
+                        monitor_server.stop_monitor_server()
+                except Exception as e:
+                    log.error(f"Error restarting monitor server on settings close: {e}", exc_info=True)
             if _poll_id[0]:
                 root.after_cancel(_poll_id[0])
             if _gfc_poll_id[0]:
@@ -1076,6 +1236,12 @@ def create_tray_icon() -> None:
                 system_overlay.toggle_overlay(_config, cfg.save_config, on_close_fn=icon.update_menu)
         except Exception as e:
             log.error(f"Error starting overlay: {e}", exc_info=True)
+
+        try:
+            if _config.get("monitor_server", {}).get("enabled", False):
+                monitor_server.start_monitor_server(_config)
+        except Exception as e:
+            log.error(f"Error starting monitor server: {e}", exc_info=True)
         
         # Refresh tray menu checkmarks after all state has been set
         try:
