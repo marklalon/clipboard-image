@@ -23,6 +23,15 @@ _fan_control_enabled = False
 _manual_pct: float = 50.0
 
 
+def _sleep_transition_active() -> bool:
+    """Check whether auto_sleep is currently entering sleep or just resumed."""
+    try:
+        import auto_sleep
+        return auto_sleep.is_sleep_transition_active()
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Hardware discovery
 # ---------------------------------------------------------------------------
@@ -220,6 +229,10 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
 
     while not _stop_event.is_set():
         try:
+            if _sleep_transition_active():
+                _stop_event.wait(interval_s)
+                continue
+
             raw_curve = config.get("fan_control", {}).get("curve", [[40, 30], [60, 50], [75, 75], [85, 100]])
             curve = sorted([(float(x), float(y)) for x, y in raw_curve])
             val = _get_source_value(source)
@@ -227,7 +240,6 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
                 # Manual mode: val IS the target percentage
                 target_pct = val if source == "manual" else _interpolate_curve(val, curve)
                 if last_target is None or abs(target_pct - last_target) >= 1.0:
-                    log.debug(f"Fan control: {source}={val:.1f} -> {target_pct:.1f}%")
                     last_target = target_pct
                 with lhm_lock:
                     for ctrl in fan_controls:
@@ -356,6 +368,10 @@ def _gpu_control_loop(config: dict) -> None:
 
     while not _gpu_stop_event.is_set():
         try:
+            if _sleep_transition_active():
+                _gpu_stop_event.wait(interval_s)
+                continue
+
             raw_curve = config.get("gpu_fan_control", {}).get("curve", [[40, 30], [60, 50], [70, 75], [80, 100]])
             curve = sorted([(float(x), float(y)) for x, y in raw_curve])
             if source == "manual":
@@ -379,7 +395,6 @@ def _gpu_control_loop(config: dict) -> None:
 
             if val_ok:
                 if last_target is None or abs(target_pct - last_target) >= 1.0:
-                    log.debug(f"GPU fan: {val_str} -> {target_pct:.1f}%")
                     last_target = target_pct
                 for i in range(n_fans):
                     try:

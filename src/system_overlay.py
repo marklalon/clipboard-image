@@ -70,7 +70,10 @@ def _serial_suffix(serial_number) -> str | None:
 
 def _normalize_disk_name(name) -> str:
     text = str(name or "Unknown").strip()
-    return " ".join(text.split()) or "Unknown"
+    # Remove trailing parentheses and their content (virtual identifiers)
+    import re
+    model = re.sub(r'\s*\([^)]*\)\s*$', '', text).strip()
+    return " ".join(model.split()) or "Unknown"
 
 
 def _build_windows_disk_serial_suffix_map(entries) -> dict[str, list[str]]:
@@ -81,6 +84,35 @@ def _build_windows_disk_serial_suffix_map(entries) -> dict[str, list[str]]:
         if model and suffix:
             suffixes[model].append(suffix)
     return dict(suffixes)
+
+
+def _get_lhm_disk_serial_suffix_map() -> dict[str, list[str]]:
+    suffixes: dict[str, list[str]] = defaultdict(list)
+    storages = sorted(
+        _lhm_disk_storage.items(),
+        key=lambda item: getattr(item[1], "DriveNumber", sys.maxsize),
+    )
+    for disk_name, storage in storages:
+        model = _normalize_disk_name(getattr(storage, "Model", None) or disk_name)
+        suffix = _serial_suffix(getattr(storage, "SerialNumber", None))
+        if model and suffix:
+            suffixes[model].append(suffix)
+    return dict(suffixes)
+
+
+def _get_preferred_disk_serial_suffix_map() -> dict[str, list[str]]:
+    suffix_map = _get_lhm_disk_serial_suffix_map()
+    if suffix_map:
+        return suffix_map
+    return _get_windows_disk_serial_suffix_map()
+
+
+def _lookup_disk_display_names(display_name_lookup, normalized_name: str) -> set[str]:
+    return {
+        display_name
+        for (model, lookup_key), display_name in (display_name_lookup or {}).items()
+        if model == normalized_name and str(lookup_key).startswith("index:")
+    }
 
 
 def _get_windows_disk_inventory_entries() -> list[dict]:
@@ -174,6 +206,15 @@ def _resolve_disk_display_name(
 ) -> str:
     normalized_name = _normalize_disk_name(disk_name)
     lookup = display_name_lookup or {}
+    serial_suffix = _serial_suffix(serial_number)
+    if serial_suffix:
+        serial_key = (normalized_name, f"serial:{serial_suffix}")
+        if serial_key in lookup:
+            return lookup[serial_key]
+
+        if len(_lookup_disk_display_names(lookup, normalized_name)) > 1:
+            return f"{normalized_name} ({serial_suffix})"
+
     if drive_number is not None:
         try:
             drive_key = (normalized_name, f"index:{int(drive_number)}")
@@ -181,12 +222,6 @@ def _resolve_disk_display_name(
                 return lookup[drive_key]
         except (TypeError, ValueError):
             pass
-
-    serial_suffix = _serial_suffix(serial_number)
-    if serial_suffix:
-        serial_key = (normalized_name, f"serial:{serial_suffix}")
-        if serial_key in lookup:
-            return lookup[serial_key]
 
     return normalized_name
 
@@ -304,7 +339,7 @@ def _get_expected_disk_display_names() -> list[str]:
     entries.sort(key=lambda entry: int(entry.get("Index", 0)))
     return _assign_unique_disk_names(
         [_normalize_disk_name(entry.get("Model")) for entry in entries],
-        _build_windows_disk_serial_suffix_map(entries),
+        _get_preferred_disk_serial_suffix_map(),
     )
 
 
@@ -346,7 +381,7 @@ def _rename_disk_temp_values(disk_values: dict[str, float]) -> dict[str, float]:
 
     display_names = _assign_unique_disk_names(
         list(disk_values.keys()),
-        _get_windows_disk_serial_suffix_map(),
+        _get_preferred_disk_serial_suffix_map(),
     )
     for display_name, value in zip(display_names, disk_values.values()):
         renamed_values[display_name] = value
@@ -510,6 +545,16 @@ def init_lhm() -> bool:
                 except Exception as _e:
                     disk_name = _normalize_disk_name(hardware.Name)
                     log.debug("Failed to get Storage object for %s: %s", disk_name, _e)
+                
+                # Always resolve disk_name for consistency, even after exception
+                if 'disk_name' not in locals() or disk_name is None:
+                    disk_name = _resolve_disk_display_name(
+                        hardware.Name,
+                        None,
+                        None,
+                        _lhm_disk_display_name_lookup,
+                    )
+                
                 selected_sensor = _select_best_disk_temp_sensor(hardware)
                 if selected_sensor is not None:
                     _lhm_disk_temps[disk_name] = selected_sensor

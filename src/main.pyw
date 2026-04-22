@@ -50,14 +50,14 @@ if os.path.exists(LOG_PATH):
     except Exception:
         open(LOG_PATH, "w", encoding="utf-8").close()
 
-logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.DEBUG)
 
 log = logging.getLogger("little_helper")
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 log.propagate = False
 
 _fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-_fh.setLevel(logging.INFO)
+_fh.setLevel(logging.DEBUG)
 _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s"))
 log.addHandler(_fh)
 
@@ -68,7 +68,7 @@ for _mod in ("little_helper.config", "little_helper.clipboard_paste",
              "little_helper.monitor_server", "little_helper.fan_control",
              "little_helper.auto_sleep"):
     _ml = logging.getLogger(_mod)
-    _ml.setLevel(logging.INFO)
+    _ml.setLevel(logging.DEBUG)
     _ml.propagate = False
     _ml.addHandler(_fh)
 
