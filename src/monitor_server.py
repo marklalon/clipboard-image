@@ -133,7 +133,8 @@ def _create_app(server_cfg: dict, ready_event: threading.Event):
     async def monitor_snapshot(request):
         if not _is_authorized(server_cfg["token"], request.headers, request.query_params):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-        return JSONResponse(system_overlay.get_monitor_snapshot())
+        snapshot_type = request.query_params.get("type", "default")
+        return JSONResponse(system_overlay.get_monitor_snapshot(type=snapshot_type))
 
     async def monitor_websocket(websocket):
         if not _is_authorized(server_cfg["token"], websocket.headers, websocket.query_params):
@@ -142,13 +143,14 @@ def _create_app(server_cfg: dict, ready_event: threading.Event):
 
         await websocket.accept()
         interval_ms = _parse_interval_ms(websocket.query_params.get("interval_ms"))
+        snapshot_type = websocket.query_params.get("type", "default")
 
         try:
             while True:
                 await websocket.send_json(
                     {
                         "type": "snapshot",
-                        "payload": system_overlay.get_monitor_snapshot(max_age_ms=interval_ms),
+                        "payload": system_overlay.get_monitor_snapshot(max_age_ms=interval_ms, type=snapshot_type),
                     }
                 )
                 await asyncio.sleep(interval_ms / 1000.0)

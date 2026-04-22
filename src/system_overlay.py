@@ -510,7 +510,6 @@ def get_system_stats() -> dict:
         "ram_pct":      None,
         "ram_temps":    None,   # list of temperatures for each RAM module
         "ram_temp_c":   None,   # average RAM temperature
-        "disk_temps":   {},     # dict: {disk_name: temp_c}
         "cpu_pct":      None,
         "cpu_temp_c":   None,
         "cpu_power_w":  None,
@@ -539,7 +538,6 @@ def get_system_stats() -> dict:
                                     sub.Update()
                                 except Exception:
                                     pass
-                    _refresh_lhm_storage_state()
                     cpu_temp  = _lhm_cpu_temp.Value  if _lhm_cpu_temp  is not None else None
                     cpu_power = _lhm_cpu_power.Value if _lhm_cpu_power is not None else None
                     ram_vals  = []
@@ -550,20 +548,11 @@ def get_system_stats() -> dict:
                                 ram_vals.append(float(v))
                         except Exception:
                             pass
-                    disk_vals = {}
-                    for disk_name, sensor in _lhm_disk_temps.items():
-                        try:
-                            v = sensor.Value
-                            if v is not None:
-                                disk_vals[disk_name] = float(v)
-                        except Exception:
-                            pass
                 result["cpu_temp_c"]  = cpu_temp
                 result["cpu_power_w"] = cpu_power
                 if ram_vals:
                     result["ram_temps"] = ram_vals
                     result["ram_temp_c"] = sum(ram_vals) / len(ram_vals)
-                result["disk_temps"] = _rename_disk_temp_values(disk_vals)
             except Exception as e:
                 log.debug(f"LHM sensor read error: {e}")
 
@@ -573,8 +562,30 @@ def get_system_stats() -> dict:
     return result
 
 
+def get_disk_stats() -> dict:
+    """Return only disk temperature statistics."""
+    result = {"disk_temps": {}}
+    if not (_lhm_available and _lhm_computer is not None):
+        return result
+    try:
+        with _lhm_lock:
+            _refresh_lhm_storage_state()
+            disk_vals = {}
+            for disk_name, sensor in _lhm_disk_temps.items():
+                try:
+                    v = sensor.Value
+                    if v is not None:
+                        disk_vals[disk_name] = float(v)
+                except Exception:
+                    pass
+        result["disk_temps"] = _rename_disk_temp_values(disk_vals)
+    except Exception as e:
+        log.debug(f"get_disk_stats error: {e}")
+    return result
+
+
 def get_monitor_stats() -> dict:
-    return {**get_system_stats(), **get_gpu_stats()}
+    return {**get_system_stats(), **get_gpu_stats(), **get_disk_stats()}
 
 
 def _temp_level(temp_c):
@@ -653,13 +664,22 @@ def build_overlay_rows(stats: dict) -> dict:
     }
 
 
-def get_monitor_snapshot(max_age_ms: int = 500) -> dict:
+def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
     global _snapshot_cache, _snapshot_cache_at
 
     max_age_s = max(_MIN_SNAPSHOT_CACHE_MS, int(max_age_ms)) / 1000.0
     now = time.monotonic()
 
     with _snapshot_lock:
+        if type == "disk":
+            # Lazy: only read disk sensors, no cache
+            disk_stats = get_disk_stats()
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "disk_temps": disk_stats["disk_temps"],
+            }
+
+        # Default type: CPU/RAM/GPU only (no disk)
         if (
             _snapshot_cache is not None
             and max_age_s > 0
@@ -667,7 +687,7 @@ def get_monitor_snapshot(max_age_ms: int = 500) -> dict:
         ):
             return copy.deepcopy(_snapshot_cache)
 
-        stats = get_monitor_stats()
+        stats = {**get_system_stats(), **get_gpu_stats()}
         snapshot = {
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "sources": {
