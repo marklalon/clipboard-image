@@ -2,7 +2,7 @@
 Little Helper - Fan control via LibreHardwareMonitor.
 
 Controls chassis fan PWM based on GPU/CPU temperature (or manual input).
-Fans with RPM >= 3000 at discovery time are treated as pumps and skipped.
+Fans with RPM >= 3100 at discovery time are treated as pumps and skipped.
 Requires administrator privileges and LHM with motherboard hardware enabled.
 """
 
@@ -39,7 +39,7 @@ def _sleep_transition_active() -> bool:
 def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
     """
     Walk Motherboard → SubHardware → Sensors(SensorType=Control) → sensor.Control.
-    Fans with current RPM >= 3000 are treated as pumps and skipped automatically.
+    Fans with current RPM >= 3100 are treated as pumps and skipped automatically.
     Includes controls with ControlMode=Undefined — LHM sometimes cannot read the
     current mode but SetSoftware() still works on the chip.
     Must be called with lhm_lock already held by the caller.
@@ -89,10 +89,10 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
                             continue
 
                         # Skip pumps (high RPM headers)
-                        if rpm_val is not None and rpm_val >= 3000:
+                        if rpm_val is not None and rpm_val >= 3100:
                             log.info(
                                 f"Skipping {sensor.Name} on {sub_hw.Name} "
-                                f"(RPM={rpm_val:.0f} >= 3000, likely pump)"
+                                f"(RPM={rpm_val:.0f} >= 3100, likely pump)"
                             )
                             continue
 

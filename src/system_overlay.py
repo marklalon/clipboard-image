@@ -584,6 +584,50 @@ def get_disk_stats() -> dict:
     return result
 
 
+def get_fan_stats() -> dict:
+    """Return fan speed statistics (RPM values) for all fans with RPM > 0.
+    
+    Returns all fans that currently have RPM > 0, which indicates they are
+    physically connected and spinning.
+    """
+    result = {"fan_speeds": {}}
+    if not (_lhm_available and _lhm_computer is not None):
+        return result
+    
+    try:
+        with _lhm_lock:
+            fan_list = []
+            for hardware in _lhm_computer.Hardware:
+                hw_type = hardware.HardwareType.ToString()
+                if hw_type != "Motherboard":
+                    continue
+                try:
+                    hardware.Update()
+                except Exception:
+                    pass
+                for sub_hw in hardware.SubHardware:
+                    try:
+                        sub_hw.Update()
+                    except Exception:
+                        pass
+                    for sensor in sub_hw.Sensors:
+                        if sensor.SensorType.ToString() != "Fan":
+                            continue
+                        try:
+                            v = sensor.Value
+                            if v is not None:
+                                rpm = float(v)
+                                # Only include fans with RPM > 0
+                                if rpm > 0:
+                                    fan_name = sensor.Name
+                                    result["fan_speeds"][fan_name] = rpm
+                        except Exception:
+                            pass
+    except Exception as e:
+        log.debug(f"get_fan_stats error: {e}")
+    return result
+
+
 def get_monitor_stats() -> dict:
     return {**get_system_stats(), **get_gpu_stats(), **get_disk_stats()}
 
@@ -677,6 +721,14 @@ def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
             return {
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "disk_temps": disk_stats["disk_temps"],
+            }
+
+        if type == "fan":
+            # Lazy: only read fan sensors, no cache
+            fan_stats = get_fan_stats()
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "fan_speeds": fan_stats["fan_speeds"],
             }
 
         # Default type: CPU/RAM/GPU only (no disk)

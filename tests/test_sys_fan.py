@@ -65,7 +65,7 @@ class SysFanTester:
     def discover_sys_fans(self):
         """
         Discover all SYS FAN controls on the motherboard.
-        Excludes CPU and PUMP fans (RPM >= 3000).
+        Excludes CPU and PUMP fans (RPM >= 3100).
         """
         if not self.computer:
             log.error("LibreHardwareMonitor not initialized")
@@ -138,8 +138,8 @@ class SysFanTester:
                             control_idx += 1
                             continue
                         
-                        # Skip pumps (RPM >= 3000)
-                        if rpm_val is not None and rpm_val >= 3000:
+                        # Skip pumps (RPM >= 3100)
+                        if rpm_val is not None and rpm_val >= 3100:
                             log.info(
                                 f"  Skipping {sensor.Name} on {sub_hw_name} "
                                 f"(pump/high-RPM, RPM={rpm_val:.0f})"
