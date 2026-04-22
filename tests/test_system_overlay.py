@@ -96,6 +96,7 @@ class SystemOverlayHelpersTest(unittest.TestCase):
         system_overlay._snapshot_cache = self._old_cache
         system_overlay._snapshot_cache_at = self._old_cache_at
         system_overlay._lhm_computer = None
+        system_overlay._lhm_available = False
         system_overlay._lhm_disk_temps = {}
         system_overlay._lhm_disk_storage = {}
         system_overlay._lhm_disk_display_name_lookup = {}
@@ -151,14 +152,14 @@ class SystemOverlayHelpersTest(unittest.TestCase):
 
         self.assertEqual(result, {"Drive B": ["X4LY"], "Drive A": ["AB3E"]})
 
-    def test_build_windows_disk_display_name_lookup_uses_serial_suffix_for_duplicates(self):
-        entries = [
-            {"Index": 1, "Model": "ZHITAI Ti600 4TB", "SerialNumber": "ZTA604TAB2522100C5"},
-            {"Index": 4, "Model": "ZHITAI Ti600 4TB", "SerialNumber": "ZTA604TAB2542300005"},
-            {"Index": 2, "Model": "Samsung SSD 980 PRO 2TB", "SerialNumber": "002538BA11B7AB3E"},
+    def test_build_lhm_disk_display_name_lookup_uses_serial_suffix_for_duplicates(self):
+        storages = [
+            (_FakeHardware("ZHITAI Ti600 4TB"), _FakeStorage("ZTA604TAB2522100C5", 1, "ZHITAI Ti600 4TB")),
+            (_FakeHardware("ZHITAI Ti600 4TB"), _FakeStorage("ZTA604TAB2542300005", 4, "ZHITAI Ti600 4TB")),
+            (_FakeHardware("Samsung SSD 980 PRO 2TB"), _FakeStorage("002538BA11B7AB3E", 2, "Samsung SSD 980 PRO 2TB")),
         ]
 
-        result = system_overlay._build_windows_disk_display_name_lookup(entries)
+        result = system_overlay._build_lhm_disk_display_name_lookup(storages)
 
         self.assertEqual(
             result,
@@ -255,7 +256,7 @@ class SystemOverlayHelpersTest(unittest.TestCase):
             ("ZHITAI Ti600 4TB", "serial:0005"): "ZHITAI Ti600 4TB (0005)",
         }
 
-        system_overlay._refresh_lhm_storage_state()
+        system_overlay._refresh_lhm_storage_state(refresh_sensor_bindings=True)
 
         self.assertEqual(
             set(system_overlay._lhm_disk_temps.keys()),
@@ -264,38 +265,38 @@ class SystemOverlayHelpersTest(unittest.TestCase):
         self.assertIs(system_overlay._lhm_disk_temps["ZHITAI Ti600 4TB (07A0)"], sensor_a)
         self.assertIs(system_overlay._lhm_disk_temps["ZHITAI Ti600 4TB (0DV5)"], sensor_b)
 
+    def test_refresh_lhm_storage_state_reuses_cached_sensor_bindings(self):
+        hardware = _FakeHardware(
+            "Disk A",
+            storage=_FakeStorage("SERIAL0001", 1, "Disk A"),
+        )
+
+        system_overlay._lhm_computer = _FakeComputer([hardware])
+        system_overlay._lhm_disk_temps = {}
+        system_overlay._lhm_disk_storage = {}
+        system_overlay._lhm_disk_display_name_lookup = {}
+
+        sensor = _FakeSensor("Temperature", value=41.0)
+        with mock.patch.object(system_overlay, "_select_best_disk_temp_sensor", return_value=sensor) as select_sensor:
+            system_overlay._refresh_lhm_storage_state(refresh_sensor_bindings=True)
+            system_overlay._refresh_lhm_storage_state()
+
+        self.assertEqual(select_sensor.call_count, 1)
+        self.assertIs(system_overlay._lhm_disk_temps["Disk A"], sensor)
+
     def test_rename_disk_temp_values_applies_duplicate_suffixes_to_payload_keys(self):
         disk_values = {
             "ZHITAI Ti600 4TB": 46.85,
             "Samsung SSD 980 PRO 2TB": 40.85,
         }
 
-        with mock.patch.object(
-            system_overlay,
-            "_get_preferred_disk_serial_suffix_map",
-            return_value={"ZHITAI Ti600 4TB": ["07A0", "0DV5"]},
-        ):
-            with mock.patch.object(
-                system_overlay,
-                "_get_expected_disk_display_names",
-                return_value=[
-                    "ST8000DM004-2U9188",
-                    "ZHITAI Ti600 4TB (07A0)",
-                    "Samsung SSD 980 PRO 2TB",
-                    "ZHITAI TiPlus7100 1TB",
-                    "ZHITAI Ti600 4TB (0DV5)",
-                ],
-            ):
-                result = system_overlay._rename_disk_temp_values(disk_values)
+        result = system_overlay._rename_disk_temp_values(disk_values)
 
         self.assertEqual(
             result,
             {
-                "ST8000DM004-2U9188": None,
-                "ZHITAI Ti600 4TB (07A0)": 46.85,
+                "ZHITAI Ti600 4TB": 46.85,
                 "Samsung SSD 980 PRO 2TB": 40.85,
-                "ZHITAI TiPlus7100 1TB": None,
-                "ZHITAI Ti600 4TB (0DV5)": None,
             },
         )
 
@@ -316,74 +317,13 @@ class SystemOverlayHelpersTest(unittest.TestCase):
             },
         )
 
-    def test_get_diskinfotoolkit_temp_values_uses_serial_specific_display_names(self):
-        class _ToolkitSmart:
-            def __init__(self, temperature):
-                self.Temperature = temperature
+    def test_get_system_stats_returns_empty_disk_temps_without_lhm(self):
+        fake_vm = mock.Mock(used=8 * 1024**3, total=16 * 1024**3, percent=50)
 
-        class _ToolkitStorage:
-            def __init__(self, model, serial_number, drive_number, temperature):
-                self.Model = model
-                self.SerialNumber = serial_number
-                self.DriveNumber = drive_number
-                self.Smart = _ToolkitSmart(temperature)
+        with mock.patch.dict(sys.modules, {"psutil": mock.Mock(virtual_memory=mock.Mock(return_value=fake_vm), cpu_percent=mock.Mock(return_value=12.5))}):
+            result = system_overlay.get_system_stats()
 
-        class _ToolkitStorageManager:
-            Storages = [
-                _ToolkitStorage("ZHITAI Ti600 4TB", "ZTA604TAB2522107A0", 1, 46),
-                _ToolkitStorage("ZHITAI Ti600 4TB", "ZTA604TAB254230DV5", 4, 44),
-            ]
-
-            @staticmethod
-            def ReloadStorages():
-                return None
-
-        system_overlay._lhm_disk_display_name_lookup = {
-            ("ZHITAI Ti600 4TB", "index:1"): "ZHITAI Ti600 4TB (00C5)",
-            ("ZHITAI Ti600 4TB", "serial:00C5"): "ZHITAI Ti600 4TB (00C5)",
-            ("ZHITAI Ti600 4TB", "index:4"): "ZHITAI Ti600 4TB (0005)",
-            ("ZHITAI Ti600 4TB", "serial:0005"): "ZHITAI Ti600 4TB (0005)",
-        }
-
-        with mock.patch.object(
-            system_overlay,
-            "_get_diskinfotoolkit_storage_manager",
-            return_value=_ToolkitStorageManager,
-        ):
-            result = system_overlay._get_diskinfotoolkit_temp_values()
-
-        self.assertEqual(
-            result,
-            {
-                "ZHITAI Ti600 4TB (07A0)": 46.0,
-                "ZHITAI Ti600 4TB (0DV5)": 44.0,
-            },
-        )
-
-    def test_get_expected_disk_display_names_excludes_usb_storage(self):
-        entries = [
-            {
-                "Index": 0,
-                "Model": "Disk A",
-                "SerialNumber": "AAA0001",
-                "InterfaceType": "SCSI",
-                "MediaType": "Fixed hard disk media",
-                "PNPDeviceID": "SCSI\\DISK&VEN_TEST",
-            },
-            {
-                "Index": 1,
-                "Model": "USB Disk",
-                "SerialNumber": "USB0001",
-                "InterfaceType": "USB",
-                "MediaType": None,
-                "PNPDeviceID": "USBSTOR\\DISK&VEN_TEST",
-            },
-        ]
-
-        with mock.patch.object(system_overlay, "_get_windows_disk_inventory_entries", return_value=entries):
-            result = system_overlay._get_expected_disk_display_names()
-
-        self.assertEqual(result, ["Disk A"])
+        self.assertEqual(result["disk_temps"], {})
 
     def test_get_monitor_snapshot_uses_minimum_half_second_cache(self):
         with mock.patch.object(system_overlay, "get_monitor_stats", side_effect=[{"cpu_pct": 10}, {"cpu_pct": 20}]) as get_stats:

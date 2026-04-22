@@ -5,9 +5,7 @@ Shows RAM, CPU, GPU stats in a draggable, resizable, semi-transparent overlay.
 """
 
 import copy
-import json
 import os
-import subprocess
 import sys
 import queue
 import time
@@ -31,7 +29,7 @@ _lhm_cpu_temp  = None   # ISensor reference
 _lhm_cpu_power = None   # ISensor reference
 _lhm_ram_temps = []     # list of ISensor references (one per DIMM)
 _lhm_disk_temps = {}    # dict: {unique_disk_name: ISensor} for disk temperatures
-_lhm_disk_storage = {}  # dict: {unique_disk_name: DiskInfoToolkit.Storage} for fallback
+_lhm_disk_storage = {}  # dict: {unique_disk_name: storage object} for runtime disk naming
 _lhm_disk_display_name_lookup = {}
 _lhm_lock      = threading.Lock()  # serialises all LHM .NET object access
 _ui_root       = None
@@ -41,8 +39,6 @@ _snapshot_lock = threading.Lock()
 _snapshot_cache = None
 _snapshot_cache_at = 0.0
 _MIN_SNAPSHOT_CACHE_MS = 500
-_diskinfotoolkit_import_attempted = False
-_diskinfotoolkit_storage_manager = None
 
 
 def _set_overlay_enabled_in_config(config: dict, save_config_fn, enabled: bool) -> bool:
@@ -111,11 +107,40 @@ def _get_lhm_disk_serial_suffix_map() -> dict[str, list[str]]:
     return dict(suffixes)
 
 
-def _get_preferred_disk_serial_suffix_map() -> dict[str, list[str]]:
-    suffix_map = _get_lhm_disk_serial_suffix_map()
-    if suffix_map:
-        return suffix_map
-    return _get_windows_disk_serial_suffix_map()
+def _build_lhm_disk_display_name_lookup(storages) -> dict[tuple[str, str | None], str]:
+    ordered_storages = sorted(
+        storages,
+        key=lambda item: getattr(item[1], "DriveNumber", sys.maxsize) if item[1] is not None else sys.maxsize,
+    )
+    serial_suffix_map: dict[str, list[str]] = defaultdict(list)
+    for hardware, storage in ordered_storages:
+        model = _normalize_disk_name(getattr(storage, "Model", None) or hardware.Name)
+        suffix = _serial_suffix(getattr(storage, "SerialNumber", None))
+        if model and suffix:
+            serial_suffix_map[model].append(suffix)
+
+    display_names = _assign_unique_disk_names(
+        [_normalize_disk_name(getattr(storage, "Model", None) or hardware.Name) for hardware, storage in ordered_storages],
+        dict(serial_suffix_map),
+    )
+    display_lookup = {}
+    for (hardware, storage), display_name in zip(ordered_storages, display_names):
+        model = _normalize_disk_name(getattr(storage, "Model", None) or hardware.Name)
+        if storage is None:
+            continue
+
+        drive_number = getattr(storage, "DriveNumber", None)
+        if drive_number is not None:
+            try:
+                display_lookup[(model, f"index:{int(drive_number)}")] = display_name
+            except (TypeError, ValueError):
+                pass
+
+        serial_suffix = _serial_suffix(getattr(storage, "SerialNumber", None))
+        if serial_suffix:
+            display_lookup[(model, f"serial:{serial_suffix}")] = display_name
+
+    return display_lookup
 
 
 def _lookup_disk_display_names(display_name_lookup, normalized_name: str) -> set[str]:
@@ -124,89 +149,6 @@ def _lookup_disk_display_names(display_name_lookup, normalized_name: str) -> set
         for (model, lookup_key), display_name in (display_name_lookup or {}).items()
         if model == normalized_name and str(lookup_key).startswith("index:")
     }
-
-
-def _get_windows_disk_inventory_entries() -> list[dict]:
-    if os.name != "nt":
-        return []
-
-    try:
-        import pythoncom
-        import wmi
-
-        pythoncom.CoInitialize()
-        try:
-            return [
-                {
-                    "Index": int(getattr(disk, "Index", 0) or 0),
-                    "Model": getattr(disk, "Model", ""),
-                    "SerialNumber": getattr(disk, "SerialNumber", ""),
-                    "InterfaceType": getattr(disk, "InterfaceType", ""),
-                    "MediaType": getattr(disk, "MediaType", ""),
-                    "PNPDeviceID": getattr(disk, "PNPDeviceID", ""),
-                }
-                for disk in wmi.WMI().Win32_DiskDrive()
-            ]
-        finally:
-            pythoncom.CoUninitialize()
-    except Exception as exc:
-        log.debug("Failed to query disk serial numbers via WMI: %s", exc)
-
-    command = (
-        "$ErrorActionPreference='Stop'; "
-        "Get-CimInstance Win32_DiskDrive | "
-        "Select-Object Index, Model, SerialNumber | "
-        "ConvertTo-Json -Compress"
-    )
-
-    try:
-        completed = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        raw = completed.stdout.strip()
-        if not raw:
-            return []
-        payload = json.loads(raw)
-        return payload if isinstance(payload, list) else [payload]
-    except Exception as exc:
-        log.debug("Failed to query disk serial numbers via PowerShell: %s", exc)
-        return []
-
-
-def _get_windows_disk_serial_suffix_map() -> dict[str, list[str]]:
-    entries = _get_windows_disk_inventory_entries()
-    if not entries:
-        return {}
-    return _build_windows_disk_serial_suffix_map(entries)
-
-
-def _build_windows_disk_display_name_lookup(entries) -> dict[tuple[str, str | None], str]:
-    ordered_entries = sorted(entries or [], key=lambda item: int(item.get("Index", 0)))
-    display_names = _assign_unique_disk_names(
-        [_normalize_disk_name(entry.get("Model")) for entry in ordered_entries],
-        _build_windows_disk_serial_suffix_map(ordered_entries),
-    )
-    display_lookup = {}
-    for entry, display_name in zip(ordered_entries, display_names):
-        model = _normalize_disk_name(entry.get("Model"))
-        display_lookup[(model, f"index:{int(entry.get('Index', 0))}")] = display_name
-        serial_suffix = _serial_suffix(entry.get("SerialNumber"))
-        if serial_suffix:
-            display_lookup[(model, f"serial:{serial_suffix}")] = display_name
-    return display_lookup
-
-
-def _get_windows_disk_display_name_lookup() -> dict[tuple[str, str | None], str]:
-    entries = _get_windows_disk_inventory_entries()
-    if not entries:
-        return {}
-    return _build_windows_disk_display_name_lookup(entries)
 
 
 def _resolve_disk_display_name(
@@ -287,15 +229,13 @@ def _select_best_disk_temp_sensor(hardware):
     return selected_sensor
 
 
-def _refresh_lhm_storage_state() -> None:
-    global _lhm_disk_display_name_lookup
+def _refresh_lhm_storage_state(refresh_sensor_bindings: bool = False) -> None:
+    global _lhm_disk_display_name_lookup, _lhm_disk_storage, _lhm_disk_temps
 
     if _lhm_computer is None:
         return
 
-    if not _lhm_disk_display_name_lookup:
-        _lhm_disk_display_name_lookup = _get_windows_disk_display_name_lookup()
-
+    storage_nodes = []
     for hardware in _iter_storage_hardware(_lhm_computer):
         try:
             hardware.Update()
@@ -308,6 +248,16 @@ def _refresh_lhm_storage_state() -> None:
             stor_obj = None
             log.debug("Failed to get Storage object for %s: %s", _normalize_disk_name(hardware.Name), exc)
 
+        storage_nodes.append((hardware, stor_obj))
+
+    if refresh_sensor_bindings or not _lhm_disk_display_name_lookup:
+        _lhm_disk_display_name_lookup = _build_lhm_disk_display_name_lookup(storage_nodes)
+
+    updated_disk_storage = {}
+    updated_disk_temps = {}
+
+    for hardware, stor_obj in storage_nodes:
+
         disk_name = _resolve_disk_display_name(
             hardware.Name,
             getattr(stor_obj, 'SerialNumber', None),
@@ -316,42 +266,17 @@ def _refresh_lhm_storage_state() -> None:
         )
 
         if stor_obj is not None:
-            _lhm_disk_storage[disk_name] = stor_obj
+            updated_disk_storage[disk_name] = stor_obj
 
-        candidates = _get_disk_temp_sensor_candidates(hardware)
-        selected_sensor = None
-        for sensor in candidates:
-            if selected_sensor is None or _disk_temp_sensor_priority(sensor.Name) < _disk_temp_sensor_priority(selected_sensor.Name):
-                selected_sensor = sensor
-        if selected_sensor is not None:
-            _lhm_disk_temps[disk_name] = selected_sensor
+        if refresh_sensor_bindings or disk_name not in _lhm_disk_temps:
+            selected_sensor = _select_best_disk_temp_sensor(hardware)
+            if selected_sensor is not None:
+                updated_disk_temps[disk_name] = selected_sensor
+        elif disk_name in _lhm_disk_temps:
+            updated_disk_temps[disk_name] = _lhm_disk_temps[disk_name]
 
-
-def _is_expected_disk_entry(entry: dict) -> bool:
-    model = _normalize_disk_name(entry.get("Model"))
-    interface_type = str(entry.get("InterfaceType") or "").strip().upper()
-    media_type = str(entry.get("MediaType") or "").strip().lower()
-    pnp_device_id = str(entry.get("PNPDeviceID") or "").strip().upper()
-
-    if not model or interface_type == "USB" or pnp_device_id.startswith("USBSTOR\\"):
-        return False
-
-    if media_type and "fixed" not in media_type:
-        return False
-
-    return True
-
-
-def _get_expected_disk_display_names() -> list[str]:
-    entries = [
-        entry for entry in _get_windows_disk_inventory_entries()
-        if _is_expected_disk_entry(entry)
-    ]
-    entries.sort(key=lambda entry: int(entry.get("Index", 0)))
-    return _assign_unique_disk_names(
-        [_normalize_disk_name(entry.get("Model")) for entry in entries],
-        _get_preferred_disk_serial_suffix_map(),
-    )
+    _lhm_disk_storage = updated_disk_storage
+    _lhm_disk_temps = updated_disk_temps
 
 
 def _assign_unique_disk_names(disk_names: list[str], serial_suffix_map: dict[str, list[str]] | None = None) -> list[str]:
@@ -383,77 +308,7 @@ def _assign_unique_disk_names(disk_names: list[str], serial_suffix_map: dict[str
 
 
 def _rename_disk_temp_values(disk_values: dict[str, float]) -> dict[str, float]:
-    renamed_values: dict[str, float | None] = {
-        disk_name: None for disk_name in _get_expected_disk_display_names()
-    }
-
-    if not disk_values:
-        return renamed_values
-
-    display_names = _assign_unique_disk_names(
-        list(disk_values.keys()),
-        _get_preferred_disk_serial_suffix_map(),
-    )
-    for display_name, value in zip(display_names, disk_values.values()):
-        renamed_values[display_name] = value
-
-    return renamed_values
-
-
-def _get_diskinfotoolkit_storage_manager():
-    global _diskinfotoolkit_import_attempted, _diskinfotoolkit_storage_manager
-
-    if _diskinfotoolkit_import_attempted:
-        return _diskinfotoolkit_storage_manager
-
-    _diskinfotoolkit_import_attempted = True
-
-    try:
-        import clr
-
-        if getattr(sys, 'frozen', False):
-            dll_dir = os.path.join(sys._MEIPASS, "lhm")
-        else:
-            dll_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "lib", "lhm")
-
-        clr.AddReference(os.path.join(dll_dir, "BlackSharp.Core.dll"))
-        clr.AddReference(os.path.join(dll_dir, "DiskInfoToolkit.dll"))
-        from DiskInfoToolkit import StorageManager
-
-        _diskinfotoolkit_storage_manager = StorageManager
-    except Exception as exc:
-        log.debug("DiskInfoToolkit fallback unavailable: %s", exc)
-        _diskinfotoolkit_storage_manager = None
-
-    return _diskinfotoolkit_storage_manager
-
-
-def _get_diskinfotoolkit_temp_values() -> dict[str, float]:
-    storage_manager = _get_diskinfotoolkit_storage_manager()
-    if storage_manager is None:
-        return {}
-
-    display_name_lookup = _lhm_disk_display_name_lookup or _get_windows_disk_display_name_lookup()
-    disk_values = {}
-
-    try:
-        storage_manager.ReloadStorages()
-        for storage in storage_manager.Storages:
-            smart = getattr(storage, 'Smart', None)
-            temp = getattr(smart, 'Temperature', None) if smart is not None else None
-            if temp is None:
-                continue
-            disk_name = _resolve_disk_display_name(
-                getattr(storage, 'Model', None),
-                getattr(storage, 'SerialNumber', None),
-                getattr(storage, 'DriveNumber', None),
-                display_name_lookup,
-            )
-            disk_values[disk_name] = float(temp)
-    except Exception as exc:
-        log.debug("DiskInfoToolkit fallback read failed: %s", exc)
-
-    return disk_values
+    return dict(disk_values)
 
 
 def init_nvml() -> bool:
@@ -514,7 +369,6 @@ def init_lhm() -> bool:
         _lhm_computer.IsNetworkEnabled = False
         _lhm_computer.IsStorageEnabled = True    # needed for disk temperatures
         _lhm_computer.Open()
-        _lhm_disk_display_name_lookup = _get_windows_disk_display_name_lookup()
 
         for hardware in _lhm_computer.Hardware:
             hw_type = hardware.HardwareType.ToString()
@@ -533,51 +387,7 @@ def init_lhm() -> bool:
                             _lhm_cpu_power = sensor
                             log.debug(f"Found CPU power sensor: {sensor.Name}")
 
-            elif hw_type == "Storage":
-                try:
-                    stor_obj = _get_storage_object(hardware)
-                    disk_name = _resolve_disk_display_name(
-                        hardware.Name,
-                        getattr(stor_obj, 'SerialNumber', None),
-                        getattr(stor_obj, 'DriveNumber', None),
-                        _lhm_disk_display_name_lookup,
-                    )
-                    if stor_obj is not None:
-                        _lhm_disk_storage[disk_name] = stor_obj
-                        log.debug(
-                            "Storage object for %s: serial=%s, SmartKey=%s, controller=%s",
-                            disk_name,
-                            getattr(stor_obj, 'SerialNumber', '?'),
-                            getattr(stor_obj, 'SmartKey', '?'),
-                            getattr(stor_obj, 'StorageControllerType', '?'),
-                        )
-                    else:
-                        log.debug("Storage property is None for %s", disk_name)
-                except Exception as _e:
-                    disk_name = _normalize_disk_name(hardware.Name)
-                    log.debug("Failed to get Storage object for %s: %s", disk_name, _e)
-                
-                # Always resolve disk_name for consistency, even after exception
-                if 'disk_name' not in locals() or disk_name is None:
-                    disk_name = _resolve_disk_display_name(
-                        hardware.Name,
-                        None,
-                        None,
-                        _lhm_disk_display_name_lookup,
-                    )
-                
-                selected_sensor = _select_best_disk_temp_sensor(hardware)
-                if selected_sensor is not None:
-                    _lhm_disk_temps[disk_name] = selected_sensor
-                    log.debug(
-                        "Selected disk temp sensor: %s -> %s",
-                        disk_name,
-                        selected_sensor.Name,
-                    )
-                else:
-                    log.debug("No temperature sensor found for disk: %s", disk_name)
-
-            else:
+            elif hw_type != "Storage":
                 # RAM temps may appear under SMBus, EmbeddedController, or other
                 # hardware types — scan all non-CPU hardware for DIMM/DDR temp sensors
                 _RAM_KEYWORDS = ("ddr", "dimm", "memory", "mem ", "mem#", "channel")
@@ -594,7 +404,7 @@ def init_lhm() -> bool:
                             _lhm_ram_temps.append(sensor)
                             log.debug(f"Found RAM temp sensor: {sensor.Name} on {hw_type}")
 
-        _refresh_lhm_storage_state()
+        _refresh_lhm_storage_state(refresh_sensor_bindings=True)
 
         _lhm_available = True
         log.info(
@@ -700,7 +510,7 @@ def get_system_stats() -> dict:
         "ram_pct":      None,
         "ram_temps":    None,   # list of temperatures for each RAM module
         "ram_temp_c":   None,   # average RAM temperature
-        "disk_temps":   None,   # dict: {disk_name: temp_c}
+        "disk_temps":   {},     # dict: {disk_name: temp_c}
         "cpu_pct":      None,
         "cpu_temp_c":   None,
         "cpu_power_w":  None,
@@ -748,27 +558,6 @@ def get_system_stats() -> dict:
                                 disk_vals[disk_name] = float(v)
                         except Exception:
                             pass
-                    # Fallback: for drives with no LHM sensor, try Smart.Temperature directly
-                    for disk_name, stor_obj in _lhm_disk_storage.items():
-                        if disk_name in disk_vals:
-                            continue
-                        try:
-                            smart = stor_obj.Smart
-                            if smart is not None:
-                                temp = smart.Temperature
-                                if temp is not None:
-                                    disk_vals[disk_name] = float(temp)
-                                    log.debug("Got temp for %s via Smart.Temperature fallback: %s", disk_name, temp)
-                        except Exception:
-                            pass
-                    missing_disk_names = [
-                        disk_name for disk_name in _get_expected_disk_display_names()
-                        if disk_name not in disk_vals
-                    ]
-                    if missing_disk_names:
-                        for disk_name, temp in _get_diskinfotoolkit_temp_values().items():
-                            if disk_name in missing_disk_names:
-                                disk_vals[disk_name] = temp
                 result["cpu_temp_c"]  = cpu_temp
                 result["cpu_power_w"] = cpu_power
                 if ram_vals:
