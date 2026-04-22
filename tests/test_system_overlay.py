@@ -99,6 +99,7 @@ class SystemOverlayHelpersTest(unittest.TestCase):
         system_overlay._lhm_disk_temps = {}
         system_overlay._lhm_disk_storage = {}
         system_overlay._lhm_disk_display_name_lookup = {}
+        system_overlay._overlay_instance = None
 
     def test_assign_unique_disk_names_appends_serial_suffix_for_duplicates(self):
         names = [
@@ -398,6 +399,88 @@ class SystemOverlayHelpersTest(unittest.TestCase):
         self.assertEqual(third["stats"], {"cpu_pct": 20})
         self.assertEqual(first["timestamp"], second["timestamp"])
         self.assertNotEqual(second["timestamp"], third["timestamp"])
+
+    def test_set_overlay_enabled_opens_overlay_and_notifies(self):
+        config = {"overlay": {"enabled": False}}
+        saved_states = []
+        events = []
+
+        def _save(updated_config):
+            saved_states.append(updated_config["overlay"]["enabled"])
+
+        class _FakeOverlay:
+            def __init__(self, overlay_config, save_config_fn, on_state_change_fn=None):
+                self.config = overlay_config
+                self.save_config = save_config_fn
+                self.on_state_change_fn = on_state_change_fn
+
+            def show(self, _parent):
+                if self.on_state_change_fn is not None:
+                    self.on_state_change_fn(True)
+
+        with mock.patch.object(system_overlay, "_ui_root", object()):
+            with mock.patch.object(system_overlay, "_run_on_ui_thread", side_effect=lambda callback: callback()):
+                with mock.patch.object(system_overlay, "SystemMonitorOverlay", _FakeOverlay):
+                    system_overlay.set_overlay_enabled(
+                        config,
+                        _save,
+                        True,
+                        on_state_change_fn=events.append,
+                    )
+
+        self.assertTrue(config["overlay"]["enabled"])
+        self.assertIsNotNone(system_overlay._overlay_instance)
+        self.assertEqual(saved_states, [True])
+        self.assertEqual(events, [True])
+
+    def test_set_overlay_enabled_closes_overlay_and_notifies(self):
+        config = {"overlay": {"enabled": True}}
+        saved_states = []
+        events = []
+
+        def _save(updated_config):
+            saved_states.append(updated_config["overlay"]["enabled"])
+
+        class _FakeOverlay:
+            def close(self, sync_config=True, notify_state=True):
+                system_overlay._overlay_instance = None
+                if sync_config and config["overlay"]["enabled"]:
+                    config["overlay"]["enabled"] = False
+                    _save(config)
+                if notify_state:
+                    events.append(False)
+
+        system_overlay._overlay_instance = _FakeOverlay()
+
+        with mock.patch.object(system_overlay, "_run_on_ui_thread", side_effect=lambda callback: callback()):
+            system_overlay.set_overlay_enabled(
+                config,
+                _save,
+                False,
+                on_state_change_fn=events.append,
+            )
+
+        self.assertFalse(config["overlay"]["enabled"])
+        self.assertIsNone(system_overlay._overlay_instance)
+        self.assertEqual(saved_states, [False])
+        self.assertEqual(events, [False])
+
+    def test_close_overlay_preserves_enabled_config(self):
+        config = {"overlay": {"enabled": True}}
+        close_calls = []
+
+        class _FakeOverlay:
+            def close(self, sync_config=True, notify_state=True):
+                close_calls.append((sync_config, notify_state))
+                system_overlay._overlay_instance = None
+
+        system_overlay._overlay_instance = _FakeOverlay()
+
+        with mock.patch.object(system_overlay, "_run_on_ui_thread", side_effect=lambda callback: callback()):
+            system_overlay.close_overlay()
+
+        self.assertEqual(close_calls, [(False, False)])
+        self.assertTrue(config["overlay"]["enabled"])
 
 
 if __name__ == "__main__":

@@ -45,6 +45,17 @@ _diskinfotoolkit_import_attempted = False
 _diskinfotoolkit_storage_manager = None
 
 
+def _set_overlay_enabled_in_config(config: dict, save_config_fn, enabled: bool) -> bool:
+    overlay_cfg = config.setdefault("overlay", {})
+    enabled = bool(enabled)
+    if bool(overlay_cfg.get("enabled", False)) == enabled:
+        return False
+
+    overlay_cfg["enabled"] = enabled
+    save_config_fn(config)
+    return True
+
+
 def _disk_temp_sensor_priority(sensor_name: str) -> tuple[int, int]:
     name = (sensor_name or "").strip().lower()
     if name == "temperature":
@@ -911,10 +922,10 @@ class SystemMonitorOverlay:
     Lives on the shared Tk UI thread as a Toplevel window.
     """
 
-    def __init__(self, config: dict, save_config_fn, on_close_fn=None):
+    def __init__(self, config: dict, save_config_fn, on_state_change_fn=None):
         self.config        = config
         self.save_config   = save_config_fn
-        self._on_close_fn  = on_close_fn
+        self._on_state_change_fn = on_state_change_fn
         self._running      = False
         self._fetch_running = False
         self._q: queue.Queue = queue.Queue(maxsize=1)
@@ -923,9 +934,18 @@ class SystemMonitorOverlay:
         self._drag_offset_x = 0
         self._drag_offset_y = 0
         self._closed = False
+        self._sync_config_on_close = True
+        self._notify_state_on_close = True
 
         self.root   = None
         self._labels = {}  # key -> tk.Label
+
+    def _notify_state_change(self, enabled: bool) -> None:
+        if self._on_state_change_fn:
+            try:
+                self._on_state_change_fn(enabled)
+            except Exception:
+                pass
 
     # -----------------------------------------------------------------------
     # Public API (called from other threads)
@@ -946,12 +966,17 @@ class SystemMonitorOverlay:
         self._build_ui()
         self._position_window()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        _set_overlay_enabled_in_config(self.config, self.save_config, True)
+        self._notify_state_change(True)
 
         # Kick off stats loop
         self.root.after(100, self._update_stats)
 
-    def close(self) -> None:
+    def close(self, sync_config: bool = True, notify_state: bool = True) -> None:
         """Destroy the window (safe to call from any thread)."""
+        self._sync_config_on_close = sync_config
+        self._notify_state_on_close = notify_state
+
         def _close_impl():
             self._finalize_close()
             if self.root is not None:
@@ -979,11 +1004,10 @@ class SystemMonitorOverlay:
         self._running = False
         if _overlay_instance is self:
             _overlay_instance = None
-        if self._on_close_fn:
-            try:
-                self._on_close_fn()
-            except Exception:
-                pass
+        if self._sync_config_on_close:
+            _set_overlay_enabled_in_config(self.config, self.save_config, False)
+        if self._notify_state_on_close:
+            self._notify_state_change(False)
 
     def _on_destroy(self, event) -> None:
         if event.widget is self.root:
@@ -1168,34 +1192,81 @@ class SystemMonitorOverlay:
 _overlay_instance: SystemMonitorOverlay | None = None
 
 
-def toggle_overlay(config: dict, save_config_fn, on_close_fn=None) -> None:
-    """Show or hide the overlay. Safe to call from any thread."""
-    def _toggle_impl():
-        global _overlay_instance
+def set_overlay_enabled(
+    config: dict,
+    save_config_fn,
+    enabled: bool,
+    on_state_change_fn=None,
+    persist_config: bool = True,
+) -> None:
+    """Apply the requested overlay enabled state and keep runtime/UI state aligned."""
+    desired = bool(enabled)
 
-        if _overlay_instance is not None:
-            _overlay_instance.close()
-        else:
-            _overlay_instance = SystemMonitorOverlay(config, save_config_fn, on_close_fn=on_close_fn)
-            _overlay_instance.show(_ui_root)
+    def _sync_impl():
+        global _overlay_instance
+        config_changed = False
+
+        if persist_config:
+            config_changed = _set_overlay_enabled_in_config(config, save_config_fn, desired)
+
+        if (_overlay_instance is not None) == desired:
+            if config_changed and on_state_change_fn:
+                try:
+                    on_state_change_fn(desired)
+                except Exception:
+                    pass
+            return
+
+        if desired:
+            instance = SystemMonitorOverlay(
+                config,
+                save_config_fn,
+                on_state_change_fn=on_state_change_fn,
+            )
+            _overlay_instance = instance
+            try:
+                instance.show(_ui_root)
+            except Exception:
+                if _overlay_instance is instance:
+                    _overlay_instance = None
+                _set_overlay_enabled_in_config(config, save_config_fn, False)
+                if on_state_change_fn:
+                    try:
+                        on_state_change_fn(False)
+                    except Exception:
+                        pass
+                raise
+            return
+
+        _overlay_instance.close(sync_config=persist_config, notify_state=True)
 
     try:
-        _run_on_ui_thread(_toggle_impl)
+        _run_on_ui_thread(_sync_impl)
     except Exception as e:
-        log.error(f"Error toggling overlay: {e}", exc_info=True)
+        log.error(f"Error setting overlay state: {e}", exc_info=True)
+
+
+def toggle_overlay(config: dict, save_config_fn, on_state_change_fn=None) -> None:
+    """Toggle the overlay based on the actual runtime window state."""
+    set_overlay_enabled(
+        config,
+        save_config_fn,
+        not overlay_is_open(),
+        on_state_change_fn=on_state_change_fn,
+    )
 
 
 def close_overlay() -> None:
     """Close overlay if open (called during shutdown)."""
     def _close_impl():
         if _overlay_instance is not None:
-            _overlay_instance.close()
+            _overlay_instance.close(sync_config=False, notify_state=False)
 
     try:
         _run_on_ui_thread(_close_impl)
     except Exception:
         if _overlay_instance is not None:
-            _overlay_instance.close()
+            _overlay_instance.close(sync_config=False, notify_state=False)
 
 
 def overlay_is_open() -> bool:

@@ -96,6 +96,7 @@ threading.excepthook = _log_thread_exception
 _config: dict    = {}
 _tray_icon       = None
 _settings_root   = None
+_settings_overlay_enabled_var = None
 _ui_root         = None
 _ui_thread       = None
 _ui_ready        = threading.Event()
@@ -113,6 +114,23 @@ def _notify(message: str, title: str = "Little Helper") -> None:
     if _tray_icon:
         try:
             _tray_icon.notify(message, title)
+        except Exception:
+            pass
+
+
+def _sync_overlay_ui_state(enabled: bool) -> None:
+    global _settings_overlay_enabled_var
+
+    if _settings_overlay_enabled_var is not None:
+        try:
+            if bool(_settings_overlay_enabled_var.get()) != bool(enabled):
+                _settings_overlay_enabled_var.set(bool(enabled))
+        except Exception:
+            _settings_overlay_enabled_var = None
+
+    if _tray_icon:
+        try:
+            _tray_icon.update_menu()
         except Exception:
             pass
 
@@ -331,7 +349,7 @@ def _apply_window_icon(root: tk.Misc) -> None:
 
 def show_settings_dialog() -> None:
     def _run():
-        global _settings_root
+        global _settings_root, _settings_overlay_enabled_var
 
         if _settings_root is not None:
             try:
@@ -435,9 +453,10 @@ def show_settings_dialog() -> None:
         # ── Section 2: Overlay ────────────────────────────────────────────────
         ov_frame = _section(outer, "System Monitor Overlay")
 
-        ov_enabled  = tk.BooleanVar(master=root, value=_config["overlay"]["enabled"])
+        ov_enabled  = tk.BooleanVar(master=root, value=system_overlay.overlay_is_open())
         ov_opacity  = tk.DoubleVar( master=root, value=_config["overlay"]["opacity"])
         ov_refresh  = tk.IntVar(    master=root, value=_config["overlay"]["refresh_ms"])
+        _settings_overlay_enabled_var = ov_enabled
 
         row4 = tk.Frame(ov_frame)
         row4.pack(fill="x", pady=3)
@@ -472,6 +491,13 @@ def show_settings_dialog() -> None:
             _config["overlay"]["opacity"]    = round(ov_opacity.get(), 2)
             _config["overlay"]["refresh_ms"] = ov_refresh.get()
             cfg.save_config(_config)
+            system_overlay.set_overlay_enabled(
+                _config,
+                cfg.save_config,
+                ov_enabled.get(),
+                on_state_change_fn=_sync_overlay_ui_state,
+                persist_config=False,
+            )
             system_overlay.apply_overlay_opacity(_config["overlay"]["opacity"])
 
         ov_enabled.trace_add("write", _apply_overlay)
@@ -1047,7 +1073,7 @@ def show_settings_dialog() -> None:
 
         # ── Close: save key fields and slider defaults ────────────────────────
         def _close():
-            global _settings_root
+            global _settings_root, _settings_overlay_enabled_var
             dirty = False
 
             new_monitor_cfg = _collect_monitor_server_config()
@@ -1080,6 +1106,7 @@ def show_settings_dialog() -> None:
                 root.after_cancel(_poll_id[0])
             if _gfc_poll_id[0]:
                 root.after_cancel(_gfc_poll_id[0])
+            _settings_overlay_enabled_var = None
             _settings_root = None
             root.destroy()
 
@@ -1115,7 +1142,11 @@ def create_tray_icon() -> None:
         show_settings_dialog()
 
     def _on_toggle_overlay(icon, item):
-        system_overlay.toggle_overlay(_config, cfg.save_config, on_close_fn=icon.update_menu)
+        system_overlay.toggle_overlay(
+            _config,
+            cfg.save_config,
+            on_state_change_fn=_sync_overlay_ui_state,
+        )
 
     def _on_toggle_fan_control(icon, item):
         if fan_control.fan_control_is_active():
@@ -1233,7 +1264,12 @@ def create_tray_icon() -> None:
         # Auto-open overlay if configured
         try:
             if _config.get("overlay", {}).get("enabled", False):
-                system_overlay.toggle_overlay(_config, cfg.save_config, on_close_fn=icon.update_menu)
+                system_overlay.set_overlay_enabled(
+                    _config,
+                    cfg.save_config,
+                    True,
+                    on_state_change_fn=_sync_overlay_ui_state,
+                )
         except Exception as e:
             log.error(f"Error starting overlay: {e}", exc_info=True)
 
