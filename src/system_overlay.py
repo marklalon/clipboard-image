@@ -41,6 +41,11 @@ _snapshot_cache = None
 _snapshot_cache_at = 0.0
 _MIN_SNAPSHOT_CACHE_MS = 500
 
+# Fan RPM cache: stores last known non-zero RPM per fan name.
+# When a fan's current RPM reads as 0, the cached value is returned instead.
+_fan_rpm_cache: dict[str, float] = {}
+_fan_rpm_cache_lock = threading.Lock()
+
 
 def _set_overlay_enabled_in_config(config: dict, save_config_fn, enabled: bool) -> bool:
     overlay_cfg = config.setdefault("overlay", {})
@@ -456,6 +461,11 @@ def init_lhm() -> bool:
 
         _refresh_lhm_storage_state(refresh_sensor_bindings=True)
 
+        # Pre-populate fan RPM cache during initialization
+        # This ensures the cache has values even if get_fan_stats() is called
+        # from an async context where Update() may not work correctly
+        _init_fan_cache()
+
         _lhm_available = True
         log.info(
             f"LibreHardwareMonitorLib initialised: CPU sensors found, "
@@ -643,19 +653,62 @@ def get_disk_stats() -> dict:
     return result
 
 
+def _init_fan_cache():
+    """Pre-populate the fan RPM cache during LHM initialization.
+
+    This ensures the cache has initial values even if get_fan_stats() is called
+    from an async context where Update() may not work correctly.
+    Must be called with lhm_lock already held by the caller.
+    """
+    if _lhm_computer is None:
+        return
+    try:
+        for hardware in _lhm_computer.Hardware:
+            hw_type = hardware.HardwareType.ToString()
+            if hw_type != "Motherboard":
+                continue
+            hardware.Update()
+            for sub_hw in hardware.SubHardware:
+                try:
+                    sub_hw.Update()
+                except Exception:
+                    pass
+                for sensor in sub_hw.Sensors:
+                    if sensor.SensorType.ToString() != "Fan":
+                        continue
+                    fan_name = sensor.Name
+                    try:
+                        v = sensor.Value
+                        if v is not None:
+                            rpm = float(v)
+                            if rpm > 0:
+                                with _fan_rpm_cache_lock:
+                                    _fan_rpm_cache[fan_name] = rpm
+                                    log.debug(f"Fan cache init: {fan_name} = {rpm} RPM")
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.debug(f"_init_fan_cache error: {e}")
+
+
 def get_fan_stats() -> dict:
-    """Return fan speed statistics (RPM values) for all fans with RPM > 0.
-    
-    Returns all fans that currently have RPM > 0, which indicates they are
-    physically connected and spinning.
+    """Return fan speed statistics (RPM values).
+
+    Maintains a cache of fan RPM values. If a fan's current RPM reads as 0,
+    the last known non-zero RPM is returned instead, so fans don't disappear
+    from the UI when they momentarily stop spinning.
     """
     result = {"fan_speeds": {}}
     if not (_lhm_available and _lhm_computer is not None):
+        # Still return cached values even if LHM is unavailable
+        with _fan_rpm_cache_lock:
+            if _fan_rpm_cache:
+                result["fan_speeds"] = dict(_fan_rpm_cache)
         return result
-    
+
+    seen_fans: set[str] = set()
     try:
         with _lhm_lock:
-            fan_list = []
             for hardware in _lhm_computer.Hardware:
                 hw_type = hardware.HardwareType.ToString()
                 if hw_type != "Motherboard":
@@ -672,19 +725,36 @@ def get_fan_stats() -> dict:
                     for sensor in sub_hw.Sensors:
                         if sensor.SensorType.ToString() != "Fan":
                             continue
+                        fan_name = sensor.Name
+                        seen_fans.add(fan_name)
                         try:
                             v = sensor.Value
                             if v is not None:
                                 rpm = float(v)
-                                # Only include fans with RPM > 0
-                                if rpm > 0:
-                                    fan_name = sensor.Name
-                                    result["fan_speeds"][fan_name] = rpm
+                                with _fan_rpm_cache_lock:
+                                    if rpm > 0:
+                                        # Update cache with current non-zero value
+                                        _fan_rpm_cache[fan_name] = rpm
+                                        result["fan_speeds"][fan_name] = rpm
+                                    elif fan_name in _fan_rpm_cache:
+                                        # RPM is 0, return cached value
+                                        result["fan_speeds"][fan_name] = _fan_rpm_cache[fan_name]
+                                    # If RPM is 0 and not in cache, skip (never seen before)
                         except Exception:
                             pass
     except Exception as e:
         log.debug(f"get_fan_stats error: {e}")
+
+    # For fans that were in the cache but not seen this round (e.g., disconnected),
+    # keep them in the result with cached values
+    with _fan_rpm_cache_lock:
+        for fan_name, cached_rpm in _fan_rpm_cache.items():
+            if fan_name not in result["fan_speeds"]:
+                result["fan_speeds"][fan_name] = cached_rpm
+
+    #log.debug(f"get_fan_stats: found {len(seen_fans)} fan sensor(s), {len(result['fan_speeds'])} with RPM data")
     return result
+
 
 
 def get_monitor_stats() -> dict:
@@ -786,9 +856,10 @@ def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
         if type == "fan":
             # Lazy: only read fan sensors, no cache
             fan_stats = get_fan_stats()
+            fan_speeds = fan_stats.get("fan_speeds", {}) if fan_stats else {}
             return {
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "fan_speeds": fan_stats["fan_speeds"],
+                "fan_speeds": fan_speeds,
             }
 
         # Default type: CPU/RAM/GPU only (no disk)
