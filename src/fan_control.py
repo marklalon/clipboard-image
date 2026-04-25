@@ -8,6 +8,7 @@ Requires administrator privileges and LHM with motherboard hardware enabled.
 
 import threading
 import logging
+import time
 
 log = logging.getLogger("little_helper.fan_control")
 
@@ -42,10 +43,22 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
     Fans with current RPM >= 3100 are treated as pumps and skipped automatically.
     Includes controls with ControlMode=Undefined — LHM sometimes cannot read the
     current mode but SetSoftware() still works on the chip.
+    When a fan's current RPM reads as 0, the system_overlay RPM cache is consulted
+    to get the last known value — this handles fans that haven't spun up yet at
+    discovery time but will spin later.
     Must be called with lhm_lock already held by the caller.
     """
     controls = []
     names    = []
+
+    rpm_cache: dict[str, float] = {}
+    try:
+        import system_overlay
+        with system_overlay._fan_rpm_cache_lock:
+            rpm_cache = dict(system_overlay._fan_rpm_cache)
+    except Exception:
+        pass
+
     try:
         for hw in lhm_computer.Hardware:
             if hw.HardwareType.ToString() != "Motherboard":
@@ -81,12 +94,21 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
                         rpm_name = rpm_sensor.Name if rpm_sensor else ""
 
                         # Skip fans with RPM=0 (disconnected headers)
+                        # But first check the cache — the fan may just not have spun up yet
                         if rpm_val is not None and rpm_val == 0:
-                            log.info(
-                                f"Skipping {sensor.Name} on {sub_hw.Name} "
-                                f"(RPM=0, disconnected)"
-                            )
-                            continue
+                            cached = rpm_cache.get(rpm_name, 0) if rpm_name else 0
+                            if cached > 0:
+                                log.info(
+                                    f"{sensor.Name} on {sub_hw.Name}: "
+                                    f"RPM=0 now, using cached={cached:.0f} for pump detection"
+                                )
+                                rpm_val = cached
+                            else:
+                                log.info(
+                                    f"Skipping {sensor.Name} on {sub_hw.Name} "
+                                    f"(RPM=0, no cached value — disconnected or not yet spinning)"
+                                )
+                                continue
 
                         # Skip pumps (high RPM headers)
                         if rpm_val is not None and rpm_val >= 3100:
@@ -208,6 +230,7 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
     source      = fc_cfg.get("source", "gpu_temp")
     interval_s  = max(1, fc_cfg.get("interval_s", 3))
     fan_indices = fc_cfg.get("fan_indices", [])
+    rediscover_interval_s = 30  # re-check for fans whose RPM was 0 at startup
 
     with lhm_lock:
         fan_controls = _discover_fan_controls(lhm_computer, fan_indices)
@@ -217,19 +240,43 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
         _controls.extend(fan_controls)
 
     if not fan_controls:
-        log.warning("Fan control loop exiting: no controllable fans found")
-        return
-
-    log.info(
-        f"Fan control loop: source={source}, interval={interval_s}s, "
-        f"fans={len(fan_controls)}, curve=dynamic"
-    )
+        log.warning(
+            "No fan controls found at startup — will retry discovery every "
+            f"{rediscover_interval_s}s. Check: (1) running as admin, "
+            "(2) Fan Control software is NOT open (conflicts with LHM), "
+            "(3) your motherboard SuperIO chip is supported by LHM."
+        )
+    else:
+        log.info(
+            f"Fan control loop: source={source}, interval={interval_s}s, "
+            f"fans={len(fan_controls)}, curve=dynamic"
+        )
 
     last_target: float | None = None
+    last_discover_at = time.monotonic()
 
     while not _stop_event.is_set():
         try:
+            # Periodic re-discovery: fans with RPM=0 at startup may now be spinning
+            now = time.monotonic()
+            if (now - last_discover_at) >= rediscover_interval_s:
+                last_discover_at = now
+                with lhm_lock:
+                    new_controls = _discover_fan_controls(lhm_computer, fan_indices)
+                if len(new_controls) != len(fan_controls):
+                    log.info(
+                        f"Fan re-discovery: {len(fan_controls)} → {len(new_controls)} control(s)"
+                    )
+                    fan_controls = new_controls
+                    with _controls_lock:
+                        _controls.clear()
+                        _controls.extend(fan_controls)
+
             if _sleep_transition_active():
+                _stop_event.wait(interval_s)
+                continue
+
+            if not fan_controls:
                 _stop_event.wait(interval_s)
                 continue
 
