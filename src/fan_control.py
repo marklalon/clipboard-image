@@ -37,7 +37,7 @@ def _sleep_transition_active() -> bool:
 # Hardware discovery
 # ---------------------------------------------------------------------------
 
-def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
+def _discover_fan_controls(lhm_computer, fan_indices: list, verbose: bool = True) -> list:
     """
     Walk Motherboard → SubHardware → Sensors(SensorType=Control) → sensor.Control.
     Fans with current RPM >= 3100 are treated as pumps and skipped automatically.
@@ -98,33 +98,37 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
                         if rpm_val is not None and rpm_val == 0:
                             cached = rpm_cache.get(rpm_name, 0) if rpm_name else 0
                             if cached > 0:
-                                log.info(
-                                    f"{sensor.Name} on {sub_hw.Name}: "
-                                    f"RPM=0 now, using cached={cached:.0f} for pump detection"
-                                )
+                                if verbose:
+                                    log.info(
+                                        f"{sensor.Name} on {sub_hw.Name}: "
+                                        f"RPM=0 now, using cached={cached:.0f} for pump detection"
+                                    )
                                 rpm_val = cached
                             else:
-                                log.info(
-                                    f"Skipping {sensor.Name} on {sub_hw.Name} "
-                                    f"(RPM=0, no cached value — disconnected or not yet spinning)"
-                                )
+                                if verbose:
+                                    log.info(
+                                        f"Skipping {sensor.Name} on {sub_hw.Name} "
+                                        f"(RPM=0, no cached value — disconnected or not yet spinning)"
+                                    )
                                 continue
 
                         # Skip pumps (high RPM headers)
                         if rpm_val is not None and rpm_val >= 3100:
-                            log.info(
-                                f"Skipping {sensor.Name} on {sub_hw.Name} "
-                                f"(RPM={rpm_val:.0f} >= 3100, likely pump)"
-                            )
+                            if verbose:
+                                log.info(
+                                    f"Skipping {sensor.Name} on {sub_hw.Name} "
+                                    f"(RPM={rpm_val:.0f} >= 3100, likely pump)"
+                                )
                             continue
 
                         fan_idx   = len(controls)
-                        rpm_hint  = f', RPM sensor: "{rpm_name}"' if rpm_name else ""
-                        rpm_cur   = f" | RPM={rpm_val:.0f}" if rpm_val is not None else ""
-                        log.info(
-                            f"[{fan_idx}] {sensor.Name} on {sub_hw.Name} "
-                            f"| id={sensor.Identifier} | mode={mode}{rpm_hint}{rpm_cur}"
-                        )
+                        if verbose:
+                            rpm_hint  = f', RPM sensor: "{rpm_name}"' if rpm_name else ""
+                            rpm_cur   = f" | RPM={rpm_val:.0f}" if rpm_val is not None else ""
+                            log.info(
+                                f"[{fan_idx}] {sensor.Name} on {sub_hw.Name} "
+                                f"| id={sensor.Identifier} | mode={mode}{rpm_hint}{rpm_cur}"
+                            )
                         controls.append(ctrl)
                         names.append(sensor.Name)
                     except Exception as e:
@@ -136,9 +140,10 @@ def _discover_fan_controls(lhm_computer, fan_indices: list) -> list:
         filtered = [(c, n) for i, (c, n) in enumerate(zip(controls, names))
                     if i in fan_indices]
         controls = [c for c, _ in filtered]
-        log.info(f"Filtered to fan_indices={fan_indices}: {len(controls)} control(s)")
+        if verbose:
+            log.info(f"Filtered to fan_indices={fan_indices}: {len(controls)} control(s)")
 
-    if not controls:
+    if not controls and verbose:
         log.warning(
             "No fan controls found. Check: (1) running as admin, "
             "(2) Fan Control software is NOT open (conflicts with LHM), "
@@ -262,7 +267,7 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
             if (now - last_discover_at) >= rediscover_interval_s:
                 last_discover_at = now
                 with lhm_lock:
-                    new_controls = _discover_fan_controls(lhm_computer, fan_indices)
+                    new_controls = _discover_fan_controls(lhm_computer, fan_indices, verbose=False)
                 if len(new_controls) != len(fan_controls):
                     log.info(
                         f"Fan re-discovery: {len(fan_controls)} → {len(new_controls)} control(s)"

@@ -50,8 +50,8 @@ _sleep_transition_event = threading.Event()
 _sleep_transition_grace_until = 0.0
 
 # Check interval (seconds)
-CHECK_INTERVAL_S = 5
-POST_SLEEP_GRACE_S = 15
+CHECK_INTERVAL_S = 10
+POST_SLEEP_GRACE_S = 30
 
 # Previous disk I/O counters for computing delta
 _last_disk_io = None
