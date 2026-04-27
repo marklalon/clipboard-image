@@ -51,6 +51,8 @@ MAX_WS_INTERVAL_MS = 60000
 MDNS_SERVICE_TYPE = "_lhm._tcp.local."
 MDNS_WATCH_INTERVAL_SEC = 10.0
 
+_MDNS_172_16_NET = None  # lazily initialised IPv4Network for 172.16/12
+
 
 def monitor_server_dependencies_available() -> tuple[bool, str | None]:
     if _STARLETTE_IMPORT_ERROR is None:
@@ -86,19 +88,15 @@ def get_monitor_urls(server_cfg: dict) -> dict:
     }
 
 
-_MDNS_172_16_NET = None  # lazily initialised IPv4Network for 172.16/12
-
-
 def _get_local_ip() -> str | None:
     """Pick the best local IPv4 for mDNS, or None if none is usable.
 
     Priority (lower wins):
       0: 192.168.x.x         (typical home/office LAN)
       1: 10.x.x.x            (corporate LAN)
-      2: 172.16-31.x.x       (RFC1918 — but on Windows usually Docker/WSL/Hyper-V)
-      3: other private ranges
-      4: public addresses
-    Skips loopback, APIPA (169.254/16), and adapters reported as down.
+      2: other private ranges
+      3: public addresses
+    Skips loopback, APIPA (169.254/16), and 172.16/12 (usually Docker/WSL/Hyper-V).
     """
     import ipaddress
 
@@ -136,14 +134,15 @@ def _get_local_ip() -> str | None:
                     ip_obj = ipaddress.IPv4Address(ip)
                 except Exception:
                     continue
+                # 172.16/12 on Windows is typically Docker/WSL/Hyper-V — skip entirely.
+                if ip_obj in _MDNS_172_16_NET:
+                    continue
                 if not ip_obj.is_private:
                     priority = 4
                 elif ip.startswith("192.168."):
                     priority = 0
                 elif ip.startswith("10."):
                     priority = 1
-                elif ip_obj in _MDNS_172_16_NET:
-                    priority = 2
                 else:
                     priority = 3
                 candidates.append((priority, nic, ip))
@@ -160,7 +159,13 @@ def _get_local_ip() -> str | None:
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
-                return ip
+                try:
+                    if ipaddress.IPv4Address(ip) in _MDNS_172_16_NET:
+                        ip = None
+                except Exception:
+                    pass
+                if ip:
+                    return ip
     except Exception:
         pass
 
@@ -489,10 +494,10 @@ class MonitorServerController:
         if server is not None:
             server.should_exit = True
         if thread is not None and thread.is_alive():
-            thread.join(timeout=5)
+            thread.join(timeout=3)
             if thread.is_alive() and server is not None:
                 server.force_exit = True
-                thread.join(timeout=2)
+                thread.join(timeout=1)
 
     def restart(self, config: dict) -> bool:
         self.stop()

@@ -297,9 +297,9 @@ def kill_previous_instance() -> None:
 
 def _on_hidden_wnd_close(hwnd, msg, wp, lp):
     log.info("WM_CLOSE received, shutting down")
-    _shutdown()
     if _tray_icon:
         _tray_icon.stop()
+    _shutdown()
     win32gui.DestroyWindow(hwnd)
     return 0
 
@@ -1139,8 +1139,8 @@ def create_tray_icon() -> None:
 
     def _on_exit(icon, item):
         log.info("Exit requested via tray")
-        _shutdown()
         icon.stop()
+        _shutdown()
 
     def _on_settings(icon, item):
         show_settings_dialog()

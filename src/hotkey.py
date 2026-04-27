@@ -238,6 +238,13 @@ def stop_keyboard_hook() -> None:
             log.error(f"Error unhoking: {e}")
         _hook_handle = None
     
+    # Post a dummy message to wake up GetMessageW so it can check _stop_event
+    if _hook_thread is not None and _hook_thread.is_alive():
+        try:
+            _user32.PostThreadMessageW(_hook_thread.ident, 0x0012, 0, 0)
+        except Exception:
+            pass  # Thread may not have a message queue; ignore
+    
     # Wait for the hook thread to finish (max 2 seconds)
     if _hook_thread is not None and _hook_thread.is_alive():
         _hook_thread.join(timeout=2)
