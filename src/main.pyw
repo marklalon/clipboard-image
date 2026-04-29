@@ -363,14 +363,19 @@ def show_settings_dialog() -> None:
 
         root = tk.Toplevel(_ui_root)
         _settings_root = root
+
+        # Withdraw BEFORE any geometry changes so the window is never painted
+        # at its default 200x200 size.
+        root.withdraw()
+
         root.title("Settings - Little Helper")
         _apply_window_icon(root)
         root.resizable(True, True)
 
         width, height = 460, 940
         root.update_idletasks()
-        x = (root.winfo_screenwidth()  // 2) - (width  // 2)
-        y = (root.winfo_screenheight() // 2) - (height // 2)
+        x = max(0, (root.winfo_screenwidth()  // 2) - (width  // 2))
+        y = max(0, (root.winfo_screenheight() // 2) - (height // 2))
         root.geometry(f"{width}x{height}+{x}+{y}")
 
         # Grab focus: set topmost briefly to cut through Windows' focus-steal
@@ -379,8 +384,6 @@ def show_settings_dialog() -> None:
             root.attributes("-topmost", True)
             _force_window_focus(root)
             root.after(400, lambda: root.attributes("-topmost", False))
-
-        root.after(50, _acquire_focus)
 
         # Scrollable content area
         _canvas = tk.Canvas(root, borderwidth=0, highlightthickness=0)
@@ -1122,6 +1125,16 @@ def show_settings_dialog() -> None:
 
         # All widgets built — allow trace callbacks to fire from now on
         _initing[0] = False
+
+        # Show the window in one smooth step:
+        # 1) set topmost so it appears above other windows
+        # 2) deiconify to reveal (window was withdrawn at creation)
+        # 3) focus and clear topmost after a short delay
+        root.attributes("-topmost", True)
+        root.update_idletasks()
+        root.deiconify()
+        root.focus_force()
+        root.after(400, lambda: root.attributes("-topmost", False))
 
     _schedule_on_ui_thread(_run)
 
