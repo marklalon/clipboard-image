@@ -392,6 +392,7 @@ def init_nvml() -> bool:
 def init_lhm() -> bool:
     """Attempt to initialise LibreHardwareMonitorLib for CPU/RAM/Disk sensors. Call once at startup."""
     global _lhm_available, _lhm_computer, _lhm_cpu_temp, _lhm_cpu_power, _lhm_ram_temps, _lhm_disk_temps, _lhm_disk_activity, _lhm_disk_storage, _lhm_disk_display_name_lookup
+    t0 = time.monotonic()
     try:
         import clr
         # Find the DLL path (works for both source and PyInstaller frozen EXE)
@@ -404,8 +405,11 @@ def init_lhm() -> bool:
             return False
 
         # Add reference to the DLL
+        t1 = time.monotonic()
         clr.AddReference(os.path.join(dll_dir, "LibreHardwareMonitorLib.dll"))
         from LibreHardwareMonitor.Hardware import Computer
+        t2 = time.monotonic()
+        log.debug(f"LHM timing: clr.AddReference = {t2-t1:.3f}s")
 
         _lhm_cpu_temp = None
         _lhm_cpu_power = None
@@ -415,6 +419,7 @@ def init_lhm() -> bool:
         _lhm_disk_storage = {}
         _lhm_disk_display_name_lookup = {}
 
+        t3 = time.monotonic()
         _lhm_computer = Computer()
         _lhm_computer.IsCpuEnabled = True
         _lhm_computer.IsGpuEnabled = False
@@ -423,11 +428,18 @@ def init_lhm() -> bool:
         _lhm_computer.IsControllerEnabled = True   # needed for SMBus (DIMM temps)
         _lhm_computer.IsNetworkEnabled = False
         _lhm_computer.IsStorageEnabled = True    # needed for disk temperatures
+        t4 = time.monotonic()
         _lhm_computer.Open()
+        t5 = time.monotonic()
+        log.debug(f"LHM timing: Computer() = {t4-t3:.3f}s, Open() = {t5-t4:.3f}s")
 
         for hardware in _lhm_computer.Hardware:
             hw_type = hardware.HardwareType.ToString()
+            t6 = time.monotonic()
             hardware.Update()
+            t7 = time.monotonic()
+            if t7 - t6 > 0.05:
+                log.debug(f"LHM timing: {hw_type}.Update() = {t7-t6:.3f}s")
 
             if hw_type == "Cpu":
                 for sensor in hardware.Sensors:
@@ -459,18 +471,28 @@ def init_lhm() -> bool:
                             _lhm_ram_temps.append(sensor)
                             log.debug(f"Found RAM temp sensor: {sensor.Name} on {hw_type}")
 
+        t8 = time.monotonic()
+        log.debug(f"LHM timing: hardware scan loop = {t8-t5:.3f}s")
+
+        t9 = time.monotonic()
         _refresh_lhm_storage_state(refresh_sensor_bindings=True)
+        t10 = time.monotonic()
+        log.debug(f"LHM timing: refresh storage state = {t10-t9:.3f}s")
 
         # Pre-populate fan RPM cache during initialization
         # This ensures the cache has values even if get_fan_stats() is called
         # from an async context where Update() may not work correctly
+        t11 = time.monotonic()
         _init_fan_cache()
+        t12 = time.monotonic()
+        log.debug(f"LHM timing: init fan cache = {t12-t11:.3f}s")
 
         _lhm_available = True
+        total = t12 - t0
         log.info(
             f"LibreHardwareMonitorLib initialised: CPU sensors found, "
             f"{len(_lhm_ram_temps)} RAM temp sensor(s), "
-            f"{len(_lhm_disk_temps)} disk sensor(s)"
+            f"{len(_lhm_disk_temps)} disk sensor(s), total={total:.3f}s"
         )
         return True
     except Exception as e:

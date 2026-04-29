@@ -232,43 +232,63 @@ def _shutdown() -> None:
     """Unified cleanup: close overlay, restore GPU, stop hook."""
     log.info("Shutting down...")
 
-    # Stop all components in a safe order with error handling
-    try:
-        _shutdown_ui_thread()
-    except Exception as e:
-        log.error(f"Error shutting down UI thread: {e}")
+    # Phase 1: Stop independent components in parallel for faster shutdown
+    def _stop_ui():
+        try:
+            _shutdown_ui_thread()
+        except Exception as e:
+            log.error(f"Error shutting down UI thread: {e}")
 
-    try:
-        monitor_server.stop_monitor_server()
-    except Exception as e:
-        log.error(f"Error stopping monitor server: {e}")
-    
-    try:
-        fan_control.stop_fan_control()
-    except Exception as e:
-        log.error(f"Error stopping fan control: {e}")
-    
-    try:
-        fan_control.stop_gpu_fan_control()
-    except Exception as e:
-        log.error(f"Error stopping GPU fan control: {e}")
-    
-    try:
-        auto_sleep.stop_auto_sleep()
-    except Exception as e:
-        log.error(f"Error stopping auto sleep: {e}")
-    
-    try:
-        gpu_power.restore_gpu_power_limit()
-    except Exception as e:
-        log.error(f"Error restoring GPU power limit: {e}")
-    
-    # Stop keyboard hook last (this may wait for thread to exit)
+    def _stop_monitor():
+        try:
+            monitor_server.stop_monitor_server()
+        except Exception as e:
+            log.error(f"Error stopping monitor server: {e}")
+
+    def _stop_fan():
+        try:
+            fan_control.stop_fan_control()
+        except Exception as e:
+            log.error(f"Error stopping fan control: {e}")
+
+    def _stop_gpu_fan():
+        try:
+            fan_control.stop_gpu_fan_control()
+        except Exception as e:
+            log.error(f"Error stopping GPU fan control: {e}")
+
+    def _stop_auto_sleep():
+        try:
+            auto_sleep.stop_auto_sleep()
+        except Exception as e:
+            log.error(f"Error stopping auto sleep: {e}")
+
+    def _restore_gpu():
+        try:
+            gpu_power.restore_gpu_power_limit()
+        except Exception as e:
+            log.error(f"Error restoring GPU power limit: {e}")
+
+    # Run all independent shutdowns in parallel
+    threads = [
+        threading.Thread(target=_stop_ui, daemon=True),
+        threading.Thread(target=_stop_monitor, daemon=True),
+        threading.Thread(target=_stop_fan, daemon=True),
+        threading.Thread(target=_stop_gpu_fan, daemon=True),
+        threading.Thread(target=_stop_auto_sleep, daemon=True),
+        threading.Thread(target=_restore_gpu, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    # Phase 2: Stop keyboard hook last (needs to run after other threads)
     try:
         hotkey.stop_keyboard_hook()
     except Exception as e:
         log.error(f"Error stopping keyboard hook: {e}")
-    
+
     log.info("Shutdown complete")
 
 
@@ -292,7 +312,7 @@ def kill_previous_instance() -> None:
         return True
 
     win32gui.EnumWindows(_enum, None)
-    time.sleep(0.5)
+    time.sleep(0.2)
 
 
 def _on_hidden_wnd_close(hwnd, msg, wp, lp):
@@ -1274,11 +1294,18 @@ def create_tray_icon() -> None:
         except Exception as e:
             log.error(f"Error starting overlay: {e}", exc_info=True)
 
-        try:
-            if _config.get("monitor_server", {}).get("enabled", False):
-                monitor_server.start_monitor_server(_config)
-        except Exception as e:
-            log.error(f"Error starting monitor server: {e}", exc_info=True)
+        # Start monitor server in background to avoid blocking tray setup
+        if _config.get("monitor_server", {}).get("enabled", False):
+            def _bg_start_monitor():
+                try:
+                    monitor_server.start_monitor_server(_config)
+                except Exception as e:
+                    log.error(f"Error starting monitor server: {e}", exc_info=True)
+            threading.Thread(
+                target=_bg_start_monitor,
+                daemon=True,
+                name="start-monitor-server",
+            ).start()
         
         # Refresh tray menu checkmarks after all state has been set
         try:
