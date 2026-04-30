@@ -157,7 +157,7 @@ def start_keyboard_hook(config: dict, on_paste_fn, on_screenshot_fn) -> None:
                         
                         # Check if we should skip paste in editable contexts
                         if should_skip_paste():
-                            log.debug(f"{hotkey_str} detected but skipping - in editable context")
+                            pass  # skip silently
                         else:
                             log.debug(f"{hotkey_str} detected via hook")
                             threading.Thread(target=on_paste_fn, daemon=True).start()

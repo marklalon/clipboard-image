@@ -110,7 +110,6 @@ def should_skip_paste() -> bool:
 
     # --- Non-Explorer: check if it's an editable window class -------------
     if cls in EDITABLE_WINDOW_CLASSES:
-        log.debug(f"Editable window class {cls} – skip paste")
         return True
 
     return False
