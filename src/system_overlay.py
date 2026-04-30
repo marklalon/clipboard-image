@@ -719,6 +719,7 @@ def get_fan_stats() -> dict:
     Maintains a cache of fan RPM values. If a fan's current RPM reads as 0,
     the last known non-zero RPM is returned instead, so fans don't disappear
     from the UI when they momentarily stop spinning.
+    Also includes GPU fan speeds (via NVML/pynvml) if available.
     """
     result = {"fan_speeds": {}}
     if not (_lhm_available and _lhm_computer is not None):
@@ -773,6 +774,25 @@ def get_fan_stats() -> dict:
         for fan_name, cached_rpm in _fan_rpm_cache.items():
             if fan_name not in result["fan_speeds"]:
                 result["fan_speeds"][fan_name] = cached_rpm
+
+    # GPU fan speeds (via NVML) — returns percentage, not RPM
+    if _nvml_available and _nvml_handle is not None:
+        try:
+            import pynvml
+            h = _nvml_handle
+            try:
+                n_fans = pynvml.nvmlDeviceGetNumFans(h)
+            except Exception:
+                n_fans = 1  # older driver: assume 1 fan
+            for i in range(n_fans):
+                try:
+                    pct = pynvml.nvmlDeviceGetFanSpeed_v2(h, i)
+                    name = f"GPU Fan {i}" if n_fans > 1 else "GPU Fan"
+                    result["fan_speeds"][name] = pct
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug(f"get_fan_stats GPU error: {e}")
 
     #log.debug(f"get_fan_stats: found {len(seen_fans)} fan sensor(s), {len(result['fan_speeds'])} with RPM data")
     return result
