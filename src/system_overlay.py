@@ -474,6 +474,22 @@ def init_lhm() -> bool:
         t8 = time.monotonic()
         log.debug(f"LHM timing: hardware scan loop = {t8-t5:.3f}s")
 
+        # Log motherboard sub-hardware for fan control debugging
+        for hardware in _lhm_computer.Hardware:
+            if hardware.HardwareType.ToString() != "Motherboard":
+                continue
+            sub_list = list(hardware.SubHardware)
+            log.info(f"Motherboard '{hardware.Name}' has {len(sub_list)} sub-hardware(s): {[s.Name for s in sub_list]}")
+            for sub_hw in sub_list:
+                try:
+                    sub_hw.Update()
+                except Exception:
+                    pass
+                sensor_types = set()
+                for s in sub_hw.Sensors:
+                    sensor_types.add(s.SensorType.ToString())
+                log.info(f"  {sub_hw.Name}: sensor types = {sensor_types}")
+
         t9 = time.monotonic()
         _refresh_lhm_storage_state(refresh_sensor_bindings=True)
         t10 = time.monotonic()

@@ -276,6 +276,8 @@ def _control_loop(config: dict, lhm_computer, lhm_lock: threading.Lock) -> None:
                     with _controls_lock:
                         _controls.clear()
                         _controls.extend(fan_controls)
+                elif len(new_controls) == 0:
+                    log.debug(f"Fan re-discovery: still 0 control(s) (will retry in {rediscover_interval_s}s)")
 
             if _sleep_transition_active():
                 _stop_event.wait(interval_s)
