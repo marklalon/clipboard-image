@@ -610,8 +610,8 @@ def _monitor_loop(config: dict) -> None:
                 _stop_event.wait(CHECK_INTERVAL_S)
                 continue
 
-            # Collect system stats
-            cpu_pct = psutil.cpu_percent(interval=0.1)
+            # Collect system stats (non-blocking to avoid holding locks)
+            cpu_pct = psutil.cpu_percent(interval=None)
             gpu_stats = get_gpu_stats()
             gpu_pct = gpu_stats.get("gpu_util_pct") or 0
             disk_mbps = _get_disk_mbps()

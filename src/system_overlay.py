@@ -40,6 +40,13 @@ _snapshot_lock = threading.Lock()
 _snapshot_cache = None
 _snapshot_cache_at = 0.0
 _MIN_SNAPSHOT_CACHE_MS = 500
+# Separate caches for disk and fan snapshots
+_disk_snapshot_cache = None
+_disk_snapshot_cache_at = 0.0
+_fan_snapshot_cache = None
+_fan_snapshot_cache_at = 0.0
+# Cache TTL for disk/fan snapshots (these are slower to read)
+_DISK_FAN_CACHE_TTL_S = 2.0
 
 # Fan RPM cache: stores last known non-zero RPM per fan name.
 # When a fan's current RPM reads as 0, the cached value is returned instead.
@@ -618,8 +625,9 @@ def get_system_stats() -> dict:
         result["ram_used_gb"]  = vm.used  / 1024**3
         result["ram_total_gb"] = vm.total / 1024**3
         result["ram_pct"]      = vm.percent
-        # Use 0.1s interval for accurate measurement (blocks fetch thread briefly)
-        result["cpu_pct"]      = psutil.cpu_percent(interval=0.1)
+        # Non-blocking CPU percent (interval=None uses previous snapshot).
+        # This avoids blocking the event loop when called from the monitor server.
+        result["cpu_pct"]      = psutil.cpu_percent(interval=None)
 
         # CPU temperature/power and RAM temps via LibreHardwareMonitorLib
         if _lhm_available and _lhm_computer is not None:
@@ -897,28 +905,46 @@ def build_overlay_rows(stats: dict) -> dict:
 
 def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
     global _snapshot_cache, _snapshot_cache_at
+    global _disk_snapshot_cache, _disk_snapshot_cache_at
+    global _fan_snapshot_cache, _fan_snapshot_cache_at
 
     max_age_s = max(_MIN_SNAPSHOT_CACHE_MS, int(max_age_ms)) / 1000.0
     now = time.monotonic()
 
     with _snapshot_lock:
         if type == "disk":
-            # Lazy: only read disk sensors, no cache
+            # Use cached disk snapshot if still fresh
+            if (
+                _disk_snapshot_cache is not None
+                and (now - _disk_snapshot_cache_at) <= _DISK_FAN_CACHE_TTL_S
+            ):
+                return copy.deepcopy(_disk_snapshot_cache)
             disk_stats = get_disk_stats()
-            return {
+            snapshot = {
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "disk_temps": disk_stats["disk_temps"],
                 "disk_activity": disk_stats["disk_activity"],
             }
+            _disk_snapshot_cache = snapshot
+            _disk_snapshot_cache_at = now
+            return copy.deepcopy(snapshot)
 
         if type == "fan":
-            # Lazy: only read fan sensors, no cache
+            # Use cached fan snapshot if still fresh
+            if (
+                _fan_snapshot_cache is not None
+                and (now - _fan_snapshot_cache_at) <= _DISK_FAN_CACHE_TTL_S
+            ):
+                return copy.deepcopy(_fan_snapshot_cache)
             fan_stats = get_fan_stats()
             fan_speeds = fan_stats.get("fan_speeds", {}) if fan_stats else {}
-            return {
+            snapshot = {
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "fan_speeds": fan_speeds,
             }
+            _fan_snapshot_cache = snapshot
+            _fan_snapshot_cache_at = now
+            return copy.deepcopy(snapshot)
 
         # Default type: CPU/RAM/GPU only (no disk)
         if (
