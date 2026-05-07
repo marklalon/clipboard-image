@@ -18,6 +18,15 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("little_helper.system_overlay")
 
+
+def _flush_log() -> None:
+    """Force-flush this logger's handlers so log lines reach disk before risky native calls."""
+    try:
+        for h in log.handlers:
+            h.flush()
+    except Exception:
+        pass
+
 # --- NVML state (initialised once at startup) ---
 _nvml_available = False
 _nvml_handle    = None
@@ -426,6 +435,8 @@ def init_lhm() -> bool:
         _lhm_disk_storage = {}
         _lhm_disk_display_name_lookup = {}
 
+        log.debug("LHM: constructing Computer()")
+        _flush_log()
         t3 = time.monotonic()
         _lhm_computer = Computer()
         _lhm_computer.IsCpuEnabled = True
@@ -436,9 +447,42 @@ def init_lhm() -> bool:
         _lhm_computer.IsNetworkEnabled = False
         _lhm_computer.IsStorageEnabled = True    # needed for disk temperatures
         t4 = time.monotonic()
-        _lhm_computer.Open()
+        log.debug("LHM: calling Open() (probes SMBus / SuperIO / SMART — can hang on conflict)")
+        _flush_log()
+
+        # Watchdog: Open() probes hardware via WinRing0 and can hang or hard-crash
+        # if another monitor (HWiNFO/AIDA64/Afterburner/OpenRGB/iCUE/Armoury Crate)
+        # holds SMBus or SuperIO. Run it in a worker thread; if it doesn't return
+        # in OPEN_TIMEOUT_S, abandon LHM init so the rest of the app can continue.
+        _open_done = threading.Event()
+        _open_error: list[BaseException] = []
+
+        def _open_worker():
+            try:
+                _lhm_computer.Open()
+            except BaseException as e:
+                _open_error.append(e)
+            finally:
+                _open_done.set()
+
+        OPEN_TIMEOUT_S = 5.0
+        threading.Thread(target=_open_worker, name="lhm-open-watchdog", daemon=True).start()
+        if not _open_done.wait(OPEN_TIMEOUT_S):
+            log.warning(
+                f"LHM Open() did not return within {OPEN_TIMEOUT_S}s — likely SMBus/SuperIO "
+                f"conflict with another monitoring tool. Disabling LHM. "
+                f"Close HWiNFO / AIDA64 / MSI Afterburner / OpenRGB / Corsair iCUE / "
+                f"Armoury Crate / CPUID HWMonitor and restart."
+            )
+            _flush_log()
+            _lhm_computer = None
+            _lhm_available = False
+            return False
+        if _open_error:
+            raise _open_error[0]
         t5 = time.monotonic()
-        log.debug(f"LHM timing: Computer() = {t4-t3:.3f}s, Open() = {t5-t4:.3f}s")
+        log.debug(f"LHM timing: Computer() + flags = {t4-t3:.3f}s, Open() = {t5-t4:.3f}s")
+        _flush_log()
 
         for hardware in _lhm_computer.Hardware:
             hw_type = hardware.HardwareType.ToString()
