@@ -465,7 +465,7 @@ def init_lhm() -> bool:
             finally:
                 _open_done.set()
 
-        OPEN_TIMEOUT_S = 5.0
+        OPEN_TIMEOUT_S = 15.0
         threading.Thread(target=_open_worker, name="lhm-open-watchdog", daemon=True).start()
         if not _open_done.wait(OPEN_TIMEOUT_S):
             log.warning(
