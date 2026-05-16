@@ -66,6 +66,57 @@ _DISK_FAN_CACHE_TTL_S = 2.0
 # When a fan's current RPM reads as 0, the cached value is returned instead.
 _fan_rpm_cache: dict[str, float] = {}
 _fan_rpm_cache_lock = threading.Lock()
+_cpu_percent_lock = threading.Lock()
+_cpu_percent_last_sample: tuple[float, float] | None = None
+
+
+def _read_cpu_percent_sample(psutil_module) -> tuple[float, float] | None:
+    try:
+        times = psutil_module.cpu_times()
+    except Exception:
+        return None
+
+    try:
+        total = float(sum(times))
+        idle = float(getattr(times, "idle", 0.0)) + float(getattr(times, "iowait", 0.0))
+    except Exception:
+        return None
+
+    return total, idle
+
+
+def _prime_cpu_percent_sampler(psutil_module) -> None:
+    global _cpu_percent_last_sample
+
+    sample = _read_cpu_percent_sample(psutil_module)
+    if sample is None:
+        return
+
+    with _cpu_percent_lock:
+        _cpu_percent_last_sample = sample
+
+
+def _get_shared_cpu_percent(psutil_module) -> float | None:
+    global _cpu_percent_last_sample
+
+    sample = _read_cpu_percent_sample(psutil_module)
+    if sample is None:
+        return None
+
+    with _cpu_percent_lock:
+        previous_sample = _cpu_percent_last_sample
+        _cpu_percent_last_sample = sample
+
+    if previous_sample is None:
+        return None
+
+    total_delta = sample[0] - previous_sample[0]
+    if total_delta <= 0:
+        return None
+
+    idle_delta = sample[1] - previous_sample[1]
+    busy_delta = total_delta - idle_delta
+    return max(0.0, min(100.0, (busy_delta / total_delta) * 100.0))
 
 
 def _set_overlay_enabled_in_config(config: dict, save_config_fn, enabled: bool) -> bool:
@@ -389,11 +440,11 @@ def _rename_disk_temp_values(disk_values: dict[str, float]) -> dict[str, float]:
 def init_nvml() -> bool:
     """Attempt to initialise pynvml for GPU index 0. Call once at startup."""
     global _nvml_available, _nvml_handle
-    # Prime psutil cpu_percent so the first background fetch returns a real value
-    # (first call with interval=None always returns 0.0 unless primed)
+    # Prime shared CPU sampling so the first background refresh can use a
+    # process-wide reference instead of per-thread psutil state.
     try:
         import psutil
-        psutil.cpu_percent(interval=None)
+        _prime_cpu_percent_sampler(psutil)
     except Exception:
         pass
     try:
@@ -674,9 +725,7 @@ def get_system_stats() -> dict:
         result["ram_used_gb"]  = vm.used  / 1024**3
         result["ram_total_gb"] = vm.total / 1024**3
         result["ram_pct"]      = vm.percent
-        # Non-blocking CPU percent (interval=None uses previous snapshot).
-        # This avoids blocking the event loop when called from the monitor server.
-        result["cpu_pct"]      = psutil.cpu_percent(interval=None)
+        result["cpu_pct"]      = _get_shared_cpu_percent(psutil)
 
         # CPU temperature/power and RAM temps via LibreHardwareMonitorLib
         if _lhm_available and _lhm_computer is not None:
