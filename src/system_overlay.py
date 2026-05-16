@@ -48,6 +48,11 @@ _ui_tasks: queue.Queue = queue.Queue()
 _snapshot_lock = threading.Lock()
 _snapshot_cache = None
 _snapshot_cache_at = 0.0
+_snapshot_refresh_events: dict[str, threading.Event | None] = {
+    "default": None,
+    "disk": None,
+    "fan": None,
+}
 _MIN_SNAPSHOT_CACHE_MS = 500
 # Separate caches for disk and fan snapshots
 _disk_snapshot_cache = None
@@ -947,69 +952,145 @@ def build_overlay_rows(stats: dict) -> dict:
     }
 
 
-def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
+def _normalize_snapshot_type(snapshot_type: str) -> str:
+    if snapshot_type == "disk":
+        return "disk"
+    if snapshot_type == "fan":
+        return "fan"
+    return "default"
+
+
+def _get_cached_snapshot(snapshot_type: str) -> tuple[dict | None, float]:
+    if snapshot_type == "disk":
+        return _disk_snapshot_cache, _disk_snapshot_cache_at
+    if snapshot_type == "fan":
+        return _fan_snapshot_cache, _fan_snapshot_cache_at
+    return _snapshot_cache, _snapshot_cache_at
+
+
+def _set_cached_snapshot(snapshot_type: str, snapshot: dict, cached_at: float) -> None:
     global _snapshot_cache, _snapshot_cache_at
     global _disk_snapshot_cache, _disk_snapshot_cache_at
     global _fan_snapshot_cache, _fan_snapshot_cache_at
 
-    max_age_s = max(_MIN_SNAPSHOT_CACHE_MS, int(max_age_ms)) / 1000.0
-    now = time.monotonic()
+    if snapshot_type == "disk":
+        _disk_snapshot_cache = snapshot
+        _disk_snapshot_cache_at = cached_at
+        return
+    if snapshot_type == "fan":
+        _fan_snapshot_cache = snapshot
+        _fan_snapshot_cache_at = cached_at
+        return
 
-    with _snapshot_lock:
-        if type == "disk":
-            # Use cached disk snapshot if still fresh
-            if (
-                _disk_snapshot_cache is not None
-                and (now - _disk_snapshot_cache_at) <= _DISK_FAN_CACHE_TTL_S
-            ):
-                return copy.deepcopy(_disk_snapshot_cache)
-            disk_stats = get_disk_stats()
-            snapshot = {
-                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "disk_temps": disk_stats["disk_temps"],
-                "disk_activity": disk_stats["disk_activity"],
-            }
-            _disk_snapshot_cache = snapshot
-            _disk_snapshot_cache_at = now
-            return copy.deepcopy(snapshot)
+    _snapshot_cache = snapshot
+    _snapshot_cache_at = cached_at
 
-        if type == "fan":
-            # Use cached fan snapshot if still fresh
-            if (
-                _fan_snapshot_cache is not None
-                and (now - _fan_snapshot_cache_at) <= _DISK_FAN_CACHE_TTL_S
-            ):
-                return copy.deepcopy(_fan_snapshot_cache)
-            fan_stats = get_fan_stats()
-            fan_speeds = fan_stats.get("fan_speeds", {}) if fan_stats else {}
-            snapshot = {
-                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "fan_speeds": fan_speeds,
-            }
-            _fan_snapshot_cache = snapshot
-            _fan_snapshot_cache_at = now
-            return copy.deepcopy(snapshot)
 
-        # Default type: CPU/RAM/GPU only (no disk)
-        if (
-            _snapshot_cache is not None
-            and max_age_s > 0
-            and (now - _snapshot_cache_at) <= max_age_s
-        ):
-            return copy.deepcopy(_snapshot_cache)
-
-        stats = {**get_system_stats(), **get_gpu_stats()}
-        snapshot = {
+def _build_monitor_snapshot(snapshot_type: str) -> dict:
+    if snapshot_type == "disk":
+        disk_stats = get_disk_stats()
+        return {
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "sources": {
-                "nvml": _nvml_available,
-                "lhm": _lhm_available,
-            },
-            "stats": stats,
+            "disk_temps": disk_stats["disk_temps"],
+            "disk_activity": disk_stats["disk_activity"],
         }
-        _snapshot_cache = snapshot
-        _snapshot_cache_at = now
-        return copy.deepcopy(snapshot)
+
+    if snapshot_type == "fan":
+        fan_stats = get_fan_stats()
+        fan_speeds = fan_stats.get("fan_speeds", {}) if fan_stats else {}
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "fan_speeds": fan_speeds,
+        }
+
+    stats = {**get_system_stats(), **get_gpu_stats()}
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "sources": {
+            "nvml": _nvml_available,
+            "lhm": _lhm_available,
+        },
+        "stats": stats,
+    }
+
+
+def _finish_snapshot_refresh(snapshot_type: str, refresh_event: threading.Event, snapshot: dict | None) -> None:
+    now = time.monotonic()
+    with _snapshot_lock:
+        if snapshot is not None:
+            _set_cached_snapshot(snapshot_type, snapshot, now)
+        if _snapshot_refresh_events.get(snapshot_type) is refresh_event:
+            _snapshot_refresh_events[snapshot_type] = None
+    refresh_event.set()
+
+
+def _refresh_snapshot_in_background(snapshot_type: str, refresh_event: threading.Event) -> None:
+    try:
+        snapshot = _build_monitor_snapshot(snapshot_type)
+    except Exception:
+        log.exception("Background monitor snapshot refresh failed for %s", snapshot_type)
+        _finish_snapshot_refresh(snapshot_type, refresh_event, None)
+        return
+
+    _finish_snapshot_refresh(snapshot_type, refresh_event, snapshot)
+
+
+def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
+    max_age_s = max(_MIN_SNAPSHOT_CACHE_MS, int(max_age_ms)) / 1000.0
+    snapshot_type = _normalize_snapshot_type(type)
+    ttl_s = _DISK_FAN_CACHE_TTL_S if snapshot_type in ("disk", "fan") else max_age_s
+
+    while True:
+        refresh_event = None
+        stale_snapshot = None
+        should_build_now = False
+        should_refresh_in_background = False
+        now = time.monotonic()
+
+        with _snapshot_lock:
+            cached_snapshot, cached_at = _get_cached_snapshot(snapshot_type)
+            if (
+                cached_snapshot is not None
+                and ttl_s > 0
+                and (now - cached_at) <= ttl_s
+            ):
+                return copy.deepcopy(cached_snapshot)
+
+            refresh_event = _snapshot_refresh_events.get(snapshot_type)
+
+            if cached_snapshot is not None:
+                stale_snapshot = copy.deepcopy(cached_snapshot)
+                if refresh_event is None:
+                    refresh_event = threading.Event()
+                    _snapshot_refresh_events[snapshot_type] = refresh_event
+                    should_refresh_in_background = True
+                else:
+                    return stale_snapshot
+            elif refresh_event is None:
+                refresh_event = threading.Event()
+                _snapshot_refresh_events[snapshot_type] = refresh_event
+                should_build_now = True
+
+        if should_refresh_in_background:
+            threading.Thread(
+                target=_refresh_snapshot_in_background,
+                args=(snapshot_type, refresh_event),
+                daemon=True,
+                name=f"snapshot-refresh-{snapshot_type}",
+            ).start()
+            return stale_snapshot
+
+        if should_build_now:
+            try:
+                snapshot = _build_monitor_snapshot(snapshot_type)
+            except Exception:
+                _finish_snapshot_refresh(snapshot_type, refresh_event, None)
+                raise
+
+            _finish_snapshot_refresh(snapshot_type, refresh_event, snapshot)
+            return copy.deepcopy(snapshot)
+
+        refresh_event.wait()
 
 
 # ---------------------------------------------------------------------------

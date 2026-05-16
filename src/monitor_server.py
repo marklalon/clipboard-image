@@ -211,6 +211,17 @@ def _parse_interval_ms(raw_value) -> int:
     return max(MIN_WS_INTERVAL_MS, min(MAX_WS_INTERVAL_MS, interval_ms))
 
 
+async def _get_monitor_snapshot_async(
+    *,
+    snapshot_type: str = "default",
+    max_age_ms: int | None = None,
+) -> dict:
+    kwargs = {"type": snapshot_type}
+    if max_age_ms is not None:
+        kwargs["max_age_ms"] = max_age_ms
+    return await asyncio.to_thread(system_overlay.get_monitor_snapshot, **kwargs)
+
+
 def _create_app(server_cfg: dict, ready_event: threading.Event):
     async def homepage(request):
         return JSONResponse(
@@ -242,7 +253,8 @@ def _create_app(server_cfg: dict, ready_event: threading.Event):
         if not _is_authorized(server_cfg["token"], request.headers, request.query_params):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         snapshot_type = request.query_params.get("type", "default")
-        return JSONResponse(system_overlay.get_monitor_snapshot(type=snapshot_type))
+        snapshot = await _get_monitor_snapshot_async(snapshot_type=snapshot_type)
+        return JSONResponse(snapshot)
 
     async def monitor_websocket(websocket):
         if not _is_authorized(server_cfg["token"], websocket.headers, websocket.query_params):
@@ -255,10 +267,14 @@ def _create_app(server_cfg: dict, ready_event: threading.Event):
 
         try:
             while True:
+                payload = await _get_monitor_snapshot_async(
+                    snapshot_type=snapshot_type,
+                    max_age_ms=interval_ms,
+                )
                 await websocket.send_json(
                     {
                         "type": "snapshot",
-                        "payload": system_overlay.get_monitor_snapshot(max_age_ms=interval_ms, type=snapshot_type),
+                        "payload": payload,
                     }
                 )
                 await asyncio.sleep(interval_ms / 1000.0)
