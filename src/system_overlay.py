@@ -96,23 +96,23 @@ def _prime_cpu_percent_sampler(psutil_module) -> None:
         _cpu_percent_last_sample = sample
 
 
-def _get_shared_cpu_percent(psutil_module) -> float:
+def _get_shared_cpu_percent(psutil_module) -> float | None:
     global _cpu_percent_last_sample
 
     sample = _read_cpu_percent_sample(psutil_module)
     if sample is None:
-        return 0.0
+        return None
 
     with _cpu_percent_lock:
         previous_sample = _cpu_percent_last_sample
         _cpu_percent_last_sample = sample
 
     if previous_sample is None:
-        return 0.0
+        return None
 
     total_delta = sample[0] - previous_sample[0]
     if total_delta <= 0:
-        return 0.0
+        return None
 
     idle_delta = sample[1] - previous_sample[1]
     busy_delta = total_delta - idle_delta
