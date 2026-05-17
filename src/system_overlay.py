@@ -390,10 +390,9 @@ def init_nvml() -> bool:
     """Attempt to initialise pynvml for GPU index 0. Call once at startup."""
     global _nvml_available, _nvml_handle
     # Prime psutil cpu_percent so the first background fetch returns a real value
-    # (first call with interval=None always returns 0.0 unless primed)
     try:
         import psutil
-        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=0.1)
     except Exception:
         pass
     try:
@@ -674,9 +673,7 @@ def get_system_stats() -> dict:
         result["ram_used_gb"]  = vm.used  / 1024**3
         result["ram_total_gb"] = vm.total / 1024**3
         result["ram_pct"]      = vm.percent
-        # Non-blocking CPU percent (interval=None uses previous snapshot).
-        # This avoids blocking the event loop when called from the monitor server.
-        result["cpu_pct"]      = psutil.cpu_percent(interval=None)
+        result["cpu_pct"]      = psutil.cpu_percent(interval=0.1)
 
         # CPU temperature/power and RAM temps via LibreHardwareMonitorLib
         if _lhm_available and _lhm_computer is not None:
