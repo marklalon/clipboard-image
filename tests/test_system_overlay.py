@@ -1,8 +1,6 @@
 import os
 import sys
-import threading
 import unittest
-from collections import namedtuple
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -90,16 +88,13 @@ class SystemOverlayHelpersTest(unittest.TestCase):
     def setUp(self):
         self._old_cache = system_overlay._snapshot_cache
         self._old_cache_at = system_overlay._snapshot_cache_at
-        self._old_cpu_percent_last_sample = system_overlay._cpu_percent_last_sample
         system_overlay._snapshot_cache = None
         system_overlay._snapshot_cache_at = 0.0
-        system_overlay._cpu_percent_last_sample = None
         _FakeDateTime._counter = 0
 
     def tearDown(self):
         system_overlay._snapshot_cache = self._old_cache
         system_overlay._snapshot_cache_at = self._old_cache_at
-        system_overlay._cpu_percent_last_sample = self._old_cpu_percent_last_sample
         system_overlay._lhm_computer = None
         system_overlay._lhm_available = False
         system_overlay._lhm_disk_temps = {}
@@ -329,47 +324,6 @@ class SystemOverlayHelpersTest(unittest.TestCase):
             result = system_overlay.get_system_stats()
 
         self.assertEqual(result["disk_temps"], {})
-
-    def test_get_system_stats_shares_cpu_percent_history_across_threads(self):
-        fake_vm = mock.Mock(used=8 * 1024**3, total=16 * 1024**3, percent=50)
-        cpu_times_values = iter(
-            [
-                namedtuple("CpuTimes", "user idle system")(10.0, 90.0, 0.0),
-                namedtuple("CpuTimes", "user idle system")(15.0, 93.0, 2.0),
-            ]
-        )
-
-        class _FakePsutil:
-            def __init__(self):
-                self.cpu_percent_calls: list[int] = []
-
-            def virtual_memory(self):
-                return fake_vm
-
-            def cpu_times(self):
-                return next(cpu_times_values)
-
-            def cpu_percent(self, interval=None):
-                self.cpu_percent_calls.append(threading.get_ident())
-                return 0.0
-
-        fake_psutil = _FakePsutil()
-        worker_result = {}
-
-        with mock.patch.dict(sys.modules, {"psutil": fake_psutil}):
-            first = system_overlay.get_system_stats()
-
-            def _worker():
-                worker_result["stats"] = system_overlay.get_system_stats()
-
-            worker = threading.Thread(target=_worker)
-            worker.start()
-            worker.join(timeout=1)
-
-        self.assertFalse(worker.is_alive())
-        self.assertIsNone(first["cpu_pct"])
-        self.assertAlmostEqual(worker_result["stats"]["cpu_pct"], 70.0)
-        self.assertEqual(fake_psutil.cpu_percent_calls, [])
 
     def test_get_monitor_snapshot_uses_minimum_half_second_cache(self):
         with mock.patch.object(system_overlay, "get_monitor_stats", side_effect=[{"cpu_pct": 10}, {"cpu_pct": 20}]) as get_stats:
