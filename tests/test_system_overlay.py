@@ -88,13 +88,20 @@ class SystemOverlayHelpersTest(unittest.TestCase):
     def setUp(self):
         self._old_cache = system_overlay._snapshot_cache
         self._old_cache_at = system_overlay._snapshot_cache_at
+        self._old_snapshot_building = dict(system_overlay._snapshot_building)
         system_overlay._snapshot_cache = None
         system_overlay._snapshot_cache_at = 0.0
+        system_overlay._snapshot_building = {
+            "default": False,
+            "disk": False,
+            "fan": False,
+        }
         _FakeDateTime._counter = 0
 
     def tearDown(self):
         system_overlay._snapshot_cache = self._old_cache
         system_overlay._snapshot_cache_at = self._old_cache_at
+        system_overlay._snapshot_building = self._old_snapshot_building
         system_overlay._lhm_computer = None
         system_overlay._lhm_available = False
         system_overlay._lhm_disk_temps = {}
@@ -317,23 +324,25 @@ class SystemOverlayHelpersTest(unittest.TestCase):
             },
         )
 
-    def test_get_system_stats_returns_empty_disk_temps_without_lhm(self):
+    def test_get_monitor_stats_returns_empty_disk_temps_without_lhm(self):
         fake_vm = mock.Mock(used=8 * 1024**3, total=16 * 1024**3, percent=50)
 
         with mock.patch.dict(sys.modules, {"psutil": mock.Mock(virtual_memory=mock.Mock(return_value=fake_vm), cpu_percent=mock.Mock(return_value=12.5))}):
-            result = system_overlay.get_system_stats()
+            result = system_overlay.get_monitor_stats()
 
         self.assertEqual(result["disk_temps"], {})
 
     def test_get_monitor_snapshot_uses_minimum_half_second_cache(self):
-        with mock.patch.object(system_overlay, "get_monitor_stats", side_effect=[{"cpu_pct": 10}, {"cpu_pct": 20}]) as get_stats:
-            with mock.patch.object(system_overlay.time, "monotonic", side_effect=[10.0, 10.2, 10.6]):
-                with mock.patch.object(system_overlay, "datetime", _FakeDateTime):
-                    first = system_overlay.get_monitor_snapshot(max_age_ms=0)
-                    second = system_overlay.get_monitor_snapshot(max_age_ms=0)
-                    third = system_overlay.get_monitor_snapshot(max_age_ms=0)
+        with mock.patch.object(system_overlay, "get_system_stats", side_effect=[{"cpu_pct": 10}, {"cpu_pct": 20}]) as get_system_stats:
+            with mock.patch.object(system_overlay, "get_gpu_stats", return_value={}) as get_gpu_stats:
+                with mock.patch.object(system_overlay.time, "monotonic", side_effect=[10.0, 10.0, 10.2, 10.6, 10.6]):
+                    with mock.patch.object(system_overlay, "datetime", _FakeDateTime):
+                        first = system_overlay.get_monitor_snapshot(max_age_ms=0)
+                        second = system_overlay.get_monitor_snapshot(max_age_ms=0)
+                        third = system_overlay.get_monitor_snapshot(max_age_ms=0)
 
-        self.assertEqual(get_stats.call_count, 2)
+        self.assertEqual(get_system_stats.call_count, 2)
+        self.assertEqual(get_gpu_stats.call_count, 2)
         self.assertEqual(first["stats"], {"cpu_pct": 10})
         self.assertEqual(second["stats"], {"cpu_pct": 10})
         self.assertEqual(third["stats"], {"cpu_pct": 20})

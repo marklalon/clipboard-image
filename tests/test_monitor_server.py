@@ -161,14 +161,14 @@ class MonitorServerHelpersTest(unittest.TestCase):
         monitor_server.monitor_server_dependencies_available()[0] and websockets is not None,
         "Monitor server dependencies are unavailable",
     )
-    def test_websocket_uses_stale_snapshot_while_refresh_runs(self):
+    def test_websocket_waits_for_fresh_snapshot_when_cache_is_stale(self):
         controller = monitor_server.MonitorServerController()
         overlay = monitor_server.system_overlay
         original_get_system_stats = overlay.get_system_stats
         original_get_gpu_stats = overlay.get_gpu_stats
         original_snapshot_cache = overlay._snapshot_cache
         original_snapshot_cache_at = overlay._snapshot_cache_at
-        original_refresh_events = dict(overlay._snapshot_refresh_events)
+        original_snapshot_building = dict(overlay._snapshot_building)
         refresh_started = threading.Event()
         refresh_finished = threading.Event()
         blocking_seconds = 0.35
@@ -220,10 +220,10 @@ class MonitorServerHelpersTest(unittest.TestCase):
         overlay.get_gpu_stats = fake_gpu_stats
         overlay._snapshot_cache = None
         overlay._snapshot_cache_at = 0.0
-        overlay._snapshot_refresh_events = {
-            "default": None,
-            "disk": None,
-            "fan": None,
+        overlay._snapshot_building = {
+            "default": False,
+            "disk": False,
+            "fan": False,
         }
 
         try:
@@ -251,17 +251,16 @@ class MonitorServerHelpersTest(unittest.TestCase):
             payload = asyncio.run(receive_ws_message(ws_url))
             elapsed = time.perf_counter() - start
 
-            self.assertLess(
+            self.assertGreaterEqual(
                 elapsed,
-                blocking_seconds * 0.5,
-                "websocket should serve the last cached snapshot while refresh runs",
+                blocking_seconds * 0.8,
+                "websocket should wait for a fresh snapshot when cache is stale",
             )
-            self.assertTrue(refresh_started.wait(timeout=1), "background refresh did not start")
+            self.assertTrue(refresh_started.wait(timeout=1), "synchronous refresh did not start")
             self.assertEqual(payload["type"], "snapshot")
-            self.assertEqual(payload["payload"]["stats"]["cpu_pct"], 10.0)
+            self.assertEqual(payload["payload"]["stats"]["cpu_pct"], 20.0)
 
-            self.assertTrue(refresh_finished.wait(timeout=2), "background refresh did not finish")
-            time.sleep(0.05)
+            self.assertTrue(refresh_finished.wait(timeout=0.1), "synchronous refresh did not finish")
 
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/monitor", timeout=1) as response:
                 refreshed_snapshot = json.loads(response.read().decode("utf-8"))
@@ -272,7 +271,7 @@ class MonitorServerHelpersTest(unittest.TestCase):
             overlay.get_gpu_stats = original_get_gpu_stats
             overlay._snapshot_cache = original_snapshot_cache
             overlay._snapshot_cache_at = original_snapshot_cache_at
-            overlay._snapshot_refresh_events = original_refresh_events
+            overlay._snapshot_building = original_snapshot_building
             controller.stop()
 
 

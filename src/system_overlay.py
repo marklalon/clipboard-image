@@ -48,10 +48,11 @@ _ui_tasks: queue.Queue = queue.Queue()
 _snapshot_lock = threading.Lock()
 _snapshot_cache = None
 _snapshot_cache_at = 0.0
-_snapshot_refresh_events: dict[str, threading.Event | None] = {
-    "default": None,
-    "disk": None,
-    "fan": None,
+# Per-type build-in-progress flag (protected by _snapshot_lock)
+_snapshot_building: dict[str, bool] = {
+    "default": False,
+    "disk": False,
+    "fan": False,
 }
 _MIN_SNAPSHOT_CACHE_MS = 500
 # Separate caches for disk and fan snapshots
@@ -1011,25 +1012,25 @@ def _build_monitor_snapshot(snapshot_type: str) -> dict:
     }
 
 
-def _finish_snapshot_refresh(snapshot_type: str, refresh_event: threading.Event, snapshot: dict | None) -> None:
-    now = time.monotonic()
+def _try_build_snapshot(snapshot_type: str) -> dict | None:
+    """Build a fresh snapshot under the lock. Returns None if another thread is already building."""
     with _snapshot_lock:
-        if snapshot is not None:
-            _set_cached_snapshot(snapshot_type, snapshot, now)
-        if _snapshot_refresh_events.get(snapshot_type) is refresh_event:
-            _snapshot_refresh_events[snapshot_type] = None
-    refresh_event.set()
+        if _snapshot_building.get(snapshot_type, False):
+            return None
+        _snapshot_building[snapshot_type] = True
 
-
-def _refresh_snapshot_in_background(snapshot_type: str, refresh_event: threading.Event) -> None:
     try:
         snapshot = _build_monitor_snapshot(snapshot_type)
+        now = time.monotonic()
+        with _snapshot_lock:
+            _set_cached_snapshot(snapshot_type, snapshot, now)
+        return snapshot
     except Exception:
-        log.exception("Background monitor snapshot refresh failed for %s", snapshot_type)
-        _finish_snapshot_refresh(snapshot_type, refresh_event, None)
-        return
-
-    _finish_snapshot_refresh(snapshot_type, refresh_event, snapshot)
+        log.exception("Monitor snapshot build failed for %s", snapshot_type)
+        raise
+    finally:
+        with _snapshot_lock:
+            _snapshot_building[snapshot_type] = False
 
 
 def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
@@ -1038,10 +1039,6 @@ def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
     ttl_s = _DISK_FAN_CACHE_TTL_S if snapshot_type in ("disk", "fan") else max_age_s
 
     while True:
-        refresh_event = None
-        stale_snapshot = None
-        should_build_now = False
-        should_refresh_in_background = False
         now = time.monotonic()
 
         with _snapshot_lock:
@@ -1053,41 +1050,14 @@ def get_monitor_snapshot(max_age_ms: int = 500, type: str = "default") -> dict:
             ):
                 return copy.deepcopy(cached_snapshot)
 
-            refresh_event = _snapshot_refresh_events.get(snapshot_type)
+        # Cache is stale – try to build a fresh one (only one thread at a time).
+        snapshot = _try_build_snapshot(snapshot_type)
 
-            if cached_snapshot is not None:
-                stale_snapshot = copy.deepcopy(cached_snapshot)
-                if refresh_event is None:
-                    refresh_event = threading.Event()
-                    _snapshot_refresh_events[snapshot_type] = refresh_event
-                    should_refresh_in_background = True
-                else:
-                    return stale_snapshot
-            elif refresh_event is None:
-                refresh_event = threading.Event()
-                _snapshot_refresh_events[snapshot_type] = refresh_event
-                should_build_now = True
-
-        if should_refresh_in_background:
-            threading.Thread(
-                target=_refresh_snapshot_in_background,
-                args=(snapshot_type, refresh_event),
-                daemon=True,
-                name=f"snapshot-refresh-{snapshot_type}",
-            ).start()
-            return stale_snapshot
-
-        if should_build_now:
-            try:
-                snapshot = _build_monitor_snapshot(snapshot_type)
-            except Exception:
-                _finish_snapshot_refresh(snapshot_type, refresh_event, None)
-                raise
-
-            _finish_snapshot_refresh(snapshot_type, refresh_event, snapshot)
+        if snapshot is not None:
             return copy.deepcopy(snapshot)
 
-        refresh_event.wait()
+        # Another thread is building – wait briefly and retry.
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------

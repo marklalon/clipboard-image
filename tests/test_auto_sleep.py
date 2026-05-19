@@ -90,7 +90,7 @@ class AutoSleepCountdownTest(unittest.TestCase):
         self.assertEqual(auto_sleep._mouse_activity_time, 1234.5)
         self.assertEqual(len(auto_sleep._samples), 0)
         self.assertFalse(auto_sleep._sleep_transition_event.is_set())
-        self.assertEqual(auto_sleep._sleep_transition_grace_until, 215.0)
+        self.assertEqual(auto_sleep._sleep_transition_grace_until, 230.0)
 
 
 if __name__ == "__main__":
